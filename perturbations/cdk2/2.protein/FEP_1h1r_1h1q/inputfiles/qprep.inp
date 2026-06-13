@@ -1,0 +1,20 @@
+rl /home/shen/code/Q2/src/QligFEP/FF/AMBER14sb.lib 
+rl 1h1r.lib
+rl 1h1q_renumber.lib
+rprm AMBER14sb_1h1r_1h1q_merged.prm 
+! TO DO Change if protein system is used
+rp 1h1r_1h1q.pdb 
+! solvation - density adapted to membrane proteins
+set solvent_pack 2.3
+set solute_density 0.05794
+boundary 1 0.535 26.773 8.816 25
+solvate 0.535 26.773 8.816 25 4 water.pdb
+!addbond at1 at2 y
+maketop MKC_p 
+writetop dualtop.top 
+wp top_p.pdb y 
+rt dualtop.top
+mask none
+mask not excluded 
+wp complexnotexcluded.pdb y 
+q 

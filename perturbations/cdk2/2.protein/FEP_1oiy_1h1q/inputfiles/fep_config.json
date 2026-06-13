@@ -1,0 +1,25 @@
+{
+    "lig1": "1oiy",
+    "lig2": "1h1q",
+    "FF": "AMBER14sb",
+    "system": "protein",
+    "cluster": "SNELLIUS",
+    "sphereradius": "25",
+    "cysbond": "auto",
+    "start": "0.5",
+    "temperature": "298",
+    "replicates": "10",
+    "sampling": "sigmoidal",
+    "timestep": "2fs",
+    "to_clean": [
+        "dcd",
+        "inp"
+    ],
+    "water_thresh": 1.7,
+    "dr_force": 0.5,
+    "random_state": 42,
+    "wath_ligand_only": false,
+    "time": "2026-06-12 23:19:09",
+    "command_str": "qligfep --lig1 1oiy --lig2 1h1q -FF AMBER14sb --system protein --cluster SNELLIUS --sphereradius 25 --cysbond auto --start 0.5 --temperature 298 --replicates 10 --sampling sigmoidal --timestep 2fs --files-to-clean dcd inp --water-thresh 1.7 --distance_restraint_force 0.5 --random_state 42 --restraint_method heavyatom_p",
+    "QligFEP_version": "2.1.1.dev130+g5917344f5"
+}

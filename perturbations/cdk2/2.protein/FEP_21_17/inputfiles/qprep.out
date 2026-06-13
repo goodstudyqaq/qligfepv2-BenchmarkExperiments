@@ -1,0 +1,318 @@
+--------------------------------------------------------------------------------
+Welcome to qprep version: 6.0.1
+ 
+This version was compiled using: GCC version 11.3.0
+ 
+And using the following compiler options: 
+-mtune=generic -march=x86-64 -O3 -w -std=legacy -funroll-all-loops -ffree-line-length-none -fcray-pointer -fall-intrinsics -fstack-protector -fpre-include=/home/shen/micromamba/envs/qligfep_new/bin/../x86_64-conda-linux-gnu/sysroot/usr/include/finclude/math-vector-fortran.h
+
+ 
+For command line options type qprep --help  or qprep -h at the terminal.
+ 
+If you are using the interactive mode you can type "help"
+at the prompt. To quit type "quit".
+--------------------------------------------------------------------------------
+
+qprep> 
+Reading molecular library /home/shen/code/Q2/src/QligFEP/FF/AMBER14sb.lib
+
+name  atoms  net Q  bonds  rules   imps Q-grps
+ACE       6   0.00      5      0      1    none, creating default
+NHE       3   0.00      2      0      1    none, creating default
+NME       6  -0.00      5      0      1    none, creating default
+ALA      10   0.00      9      0      2    none, creating default
+ARG      24   1.00     23      0      6    none, creating default
+ARN      23   0.00     22      0      5    none, creating default
+ASH      13  -0.00     12      0      3    none, creating default
+ASN      14   0.00     13      0      4    none, creating default
+ASP      12  -1.00     11      0      3    none, creating default
+CYM      10  -1.00      9      0      2    none, creating default
+CYS      11   0.00     10      0      2    none, creating default
+CYX      10   0.00      9      0      2    none, creating default
+GLH      16   0.00     15      0      3    none, creating default
+GLN      17   0.00     16      0      4    none, creating default
+GLU      15  -1.00     14      0      3    none, creating default
+GLY       7   0.00      6      0      2    none, creating default
+HID      17  -0.00     17      0      6    none, creating default
+HIE      17  -0.00     17      0      6    none, creating default
+HIP      18   1.00     18      0      7    none, creating default
+HYP      15   0.00     15      0      2    none, creating default
+ILE      19   0.00     18      0      2    none, creating default
+LEU      19   0.00     18      0      2    none, creating default
+LYN      21   0.00     20      0      2    none, creating default
+LYS      22   1.00     21      0      2    none, creating default
+MET      17   0.00     16      0      2    none, creating default
+PHE      20   0.00     20      0      8    none, creating default
+PRO      14   0.00     14      0      2    none, creating default
+SER      11   0.00     10      0      2    none, creating default
+THR      14  -0.00     13      0      2    none, creating default
+TRP      24   0.00     25      0      9    none, creating default
+TYR      21   0.00     21      0      8    none, creating default
+VAL      16  -0.00     15      0      2    none, creating default
+NALA     12   1.00     11      0      1    none, creating default
+NARG     26   2.00     25      0      5    none, creating default
+NASN     16   1.00     15      0      3    none, creating default
+NASP     14   0.00     13      0      2    none, creating default
+NCYS     13   1.00     12      0      1    none, creating default
+NCYX     12   1.00     11      0      1    none, creating default
+NGLN     19   1.00     18      0      3    none, creating default
+NGLU     17   0.00     16      0      2    none, creating default
+NGLY      9   1.00      8      0      1    none, creating default
+NHID     19   1.00     19      0      5    none, creating default
+NHIE     19   1.00     19      0      5    none, creating default
+NHIP     20   2.00     20      0      6    none, creating default
+NILE     21   1.00     20      0      1    none, creating default
+NLEU     21   1.00     20      0      1    none, creating default
+NLYS     24   2.00     23      0      1    none, creating default
+NMET     19   1.00     18      0      1    none, creating default
+NPHE     22   1.00     22      0      7    none, creating default
+NPRO     16   1.00     16      0      1    none, creating default
+NSER     13   1.00     12      0      1    none, creating default
+NTHR     16   1.00     15      0      1    none, creating default
+NTRP     26   1.00     27      0      8    none, creating default
+NTYR     23   1.00     23      0      7    none, creating default
+NVAL     18   1.00     17      0      1    none, creating default
+CALA     11  -1.00     10      0      2    none, creating default
+CARG     25  -0.00     24      0      6    none, creating default
+CASN     15  -1.00     14      0      4    none, creating default
+CASP     13  -2.00     12      0      3    none, creating default
+CCYS     12  -1.00     11      0      2    none, creating default
+CCYX     11  -1.00     10      0      2    none, creating default
+CGLN     18  -1.00     17      0      4    none, creating default
+CGLU     16  -2.00     15      0      3    none, creating default
+CGLY      8  -1.00      7      0      2    none, creating default
+CHID     18  -1.00     18      0      6    none, creating default
+CHIE     18  -1.00     18      0      6    none, creating default
+CHIP     19   0.00     19      0      7    none, creating default
+CHYP     16  -1.00     16      0      2    none, creating default
+CILE     20  -1.00     19      0      2    none, creating default
+CLEU     20  -1.00     19      0      2    none, creating default
+CLYS     23  -0.00     22      0      2    none, creating default
+CMET     18  -1.00     17      0      2    none, creating default
+CPHE     21  -1.00     21      0      8    none, creating default
+CPRO     15  -1.00     15      0      2    none, creating default
+CSER     12  -1.00     11      0      2    none, creating default
+CTHR     15  -1.00     14      0      2    none, creating default
+CTRP     25  -1.00     26      0      9    none, creating default
+CTYR     22  -1.00     22      0      8    none, creating default
+CVAL     17  -1.00     16      0      2    none, creating default
+TPO      17  -2.00     16      0      2    none, creating default
+POP     134  -0.00    133      0      2    none, creating default
+HOH       3   0.00      3      0      0    none, creating default
+SOD       1   1.00      0      0      0      1
+MAG       1   2.00      0      0      0      1
+CHL       1  -1.00      0      0      0      1
+ZIN       1   2.00      0      0      0      1
+
+Accumulated no. of library entries loaded =  86
+
+qprep> 
+Reading molecular library 21.lib
+
+name  atoms  net Q  bonds  rules   imps Q-grps
+LIG      49   0.00     52      0     13    none, creating default
+
+Accumulated no. of library entries loaded =  87
+
+qprep> 
+Reading molecular library 17_renumber.lib
+
+name  atoms  net Q  bonds  rules   imps Q-grps
+LID      45   0.00     48      0     13    none, creating default
+
+Accumulated no. of library entries loaded =  88
+
+qprep> 
+Reading force field parameter file.
+Forcefield name:               Q-Amber14SB
+Forcefield type:               AMBER
+Lennard-Jones combination rule:ARITHMETIC
+Scaling of 1-4 electrostatics: 0.833
+Cut-off rule:                  any atoms
+Improper potential:            PERIODIC
+Improper generation:           EXPLICIT
+Coulomb constant is set to the default value of 332.
+Read  190 atom types
+>>>>> WARNING: No SYBYL name for one or more atom types.
+Read    0 atom type alias names
+Read    0 LJ type 2 pairs
+Read  326 bond types
+Read  105 unique bond parameters
+>>>>> WARNING: No SYBYL bond type for one or more bond types.
+Read  783 angle types
+Read  196  unique angle parameters
+Read 1243 torsion types
+Read  434 unique torsion parameters
+Read   97 improper types
+Force field parameters successfully read.
+
+qprep> 
+PDB file contains  9077 atoms.
+The number of atoms in the topology will be  9126
+molecule    1: ACE     1 - NME   299
+molecule    2: ACE   300 - NME   559
+molecule    3: LIG   560
+molecule    4: LID   561
+
+Successfully read PDB file with    4 molecules,
+  561 residues total (  561 in solute).
+ 9126 atoms total ( 9126 in solute).
+
+Sequence listing:
+
+ACE  SER  MET  GLH  ASN  PHE  GLN  LYS  VAL  GLU  LYS  ILE  GLY  GLU  GLY  THR 
+TYR  GLY  VAL  VAL  TYR  LYS  ALA  ARG  ASN  LYN  LEU  THR  GLY  GLU  VAL  VAL 
+ALA  LEU  LYS  LYS  ILE  ARG  LEU  ASH  THR  GLH  THR  GLH  GLY  VAL  PRO  SER 
+THR  ALA  ILE  ARG  GLU  ILE  SER  LEU  LEU  LYN  GLH  LEU  ASN  HIE  PRO  ASN 
+ILE  VAL  LYS  LEU  LEU  ASP  VAL  ILE  HIE  THR  GLH  ASN  LYS  LEU  TYR  LEU 
+VAL  PHE  GLU  PHE  LEU  HIE  GLN  ASP  LEU  LYS  LYS  PHE  MET  ASP  ALA  SER 
+ALA  LEU  THR  GLY  ILE  PRO  LEU  PRO  LEU  ILE  LYN  SER  TYR  LEU  PHE  GLN 
+LEU  LEU  GLN  GLY  LEU  ALA  PHE  CYS  HIE  SER  HID  ARN  VAL  LEU  HIE  ARG 
+ASP  LEU  LYS  PRO  GLN  ASN  LEU  LEU  ILE  ASN  THR  GLU  GLY  ALA  ILE  LYS 
+LEU  ALA  ASP  PHE  GLY  LEU  ALA  ARN  ALA  PHE  GLY  VAL  PRO  VAL  ARN  THR 
+TYR  THR  HIE  GLH  VAL  VAL  THR  LEU  TRP  TYR  ARG  ALA  PRO  GLH  ILE  LEU 
+LEU  GLY  CYS  LYN  TYR  TYR  SER  THR  ALA  VAL  ASP  ILE  TRP  SER  LEU  GLY 
+CYS  ILE  PHE  ALA  GLU  MET  VAL  THR  ARN  ARN  ALA  LEU  PHE  PRO  GLY  ASH 
+SER  GLH  ILE  ASH  GLN  LEU  PHE  ARN  ILE  PHE  ARN  THR  LEU  GLY  THR  PRO 
+ASH  GLH  VAL  VAL  TRP  PRO  GLY  VAL  THR  SER  MET  PRO  ASH  TYR  LYN  PRO 
+SER  PHE  PRO  LYN  TRP  ALA  ARN  GLN  ASH  PHE  SER  LYN  VAL  VAL  PRO  PRO 
+LEU  ASH  GLH  ASH  GLY  ARN  SER  LEU  LEU  SER  GLN  MET  LEU  HID  TYR  ASH 
+PRO  ASN  LYN  ARN  ILE  SER  ALA  LYN  ALA  ALA  LEU  ALA  HIE  PRO  PHE  PHE 
+GLN  ASH  VAL  THR  LYS  PRO  VAL  PRO  HID  LEU  NME  ACE  VAL  PRO  ASH  TYR 
+HIE  GLH  ASH  ILE  HID  THR  TYR  LEU  ARN  GLH  MET  GLH  VAL  LYN  CYS  LYN 
+PRO  LYN  VAL  GLY  TYR  MET  LYN  LYN  GLN  PRO  ASH  ILE  THR  ASN  SER  MET 
+ARN  ALA  ILE  LEU  VAL  ASH  TRP  LEU  VAL  GLH  VAL  GLY  GLH  GLH  TYR  LYN 
+LEU  GLN  ASN  GLH  THR  LEU  HID  LEU  ALA  VAL  ASN  TYR  ILE  ASH  ARN  PHE 
+LEU  SER  SER  MET  SER  VAL  LEU  ARN  GLY  LYN  LEU  GLN  LEU  VAL  GLY  THR 
+ALA  ALA  MET  LEU  LEU  ALA  SER  LYN  PHE  GLH  GLH  ILE  TYR  PRO  PRO  GLH 
+VAL  ALA  GLH  PHE  VAL  TYR  ILE  THR  ASH  ASH  THR  TYR  THR  LYN  LYN  GLN 
+VAL  LEU  ARN  MET  GLH  HIE  LEU  VAL  LEU  LYN  VAL  LEU  THR  PHE  ASH  LEU 
+ALA  ALA  PRO  THR  VAL  ASN  GLN  PHE  LEU  THR  GLN  TYR  PHE  LEU  HIE  GLN 
+GLN  PRO  ALA  ASN  CYS  LYN  VAL  GLH  SER  LEU  ALA  MET  PHE  LEU  GLY  GLH 
+LEU  SER  LEU  ILE  ASH  ALA  ASH  PRO  TYR  LEU  LYN  TYR  LEU  PRO  SER  VAL 
+ILE  ALA  GLY  ALA  ALA  PHE  HIE  LEU  ALA  LEU  TYR  THR  VAL  THR  GLY  GLN 
+SER  TRP  PRO  GLH  SER  LEU  ILE  ARN  LYN  THR  GLY  TYR  THR  LEU  GLH  SER 
+LEU  LYN  PRO  CYS  LEU  MET  ASH  LEU  HIE  GLN  THR  TYR  LEU  LYN  ALA  PRO 
+GLN  HIE  ALA  GLN  GLN  SER  ILE  ARN  GLH  LYN  TYR  LYN  ASN  SER  LYN  TYR 
+HID  GLY  VAL  SER  LEU  LEU  ASN  PRO  PRO  GLH  THR  LEU  ASN  LEU  NME  LIG 
+LID 
+
+qprep> qprep> qprep> 
+Simulation sphere center                =      0.736  26.728   8.942
+Simulation radius                       =     25.000
+qprep> 
+Solvation sphere center                 =      0.736  26.728   8.942
+Radius of sphere in solvent file        =     25.000
+Library entry used to generate solvent  =       HOH 
+No. of molecules in solvent file           =        975
+No. of solvent molecules in the sphere:******
+Minimum distance to solute heavy atoms (solvent_pack):  2.30 A
+No. of solvent molecules to add to the system:   971
+qprep> Assigned 12039 atom types.
+Assigned 12039 atomic charges.
+Made      9244 solute bonds.
+Made         0 extra bonds.
+Made      2913 solvent bonds.
+Made     16716 solute angles.
+Made      2913 solvent angles.
+Made     39317 solute torsions.
+Made         0 solvent torsions.
+Made      1767 solute impropers.
+Made         0 solvent impropers.
+Made     24382 entries in the 1-4 neighbour list.
+Made        69 entries in the long-range 1-4 neighbour list.
+Made     31707 entries in list of excluded neighbours.
+Made        79 entries in list of long-range excluded neighbours.
+Made        49 solute hydrogens.
+Made         0 solvent hydrogens.
+Made      200 solute  charge groups comprising a total of   3325 atoms.
+Made      971 solvent charge groups comprising a total of   2913 atoms.
+Skipped   361excluded charge groups comprising a total of   5801 atoms.
+Effective water radius                     : 23.33
+Topology successfully generated.
+qprep> 
+---------------------------- Writing topology file ---------------------------
+solute atoms                :   9126
+solvent atoms               :   2913
+coordinates                 :  36117
+integer atom codes          :  12039
+solute bonds                :   9244
+solvent bonds               :   2913
+bond parameters             :     49
+solute angles               :  16716
+solvent angles              :   2913
+angle parameters            :     57
+torsions                    :  39317
+torsion parameters          :    236
+impropers                   :   1767
+improper parameters         :     46
+charges                     :  12039
+total charge of not excluded:   4.00
+charge groups               :   1171
+atom type parameters        :    190
+polar LJ pairs              :      0
+neighbour list              :  24382
+long-range neighbour list   :     69
+neighbour exclusion list    :  31707
+long-range exclusions       :     79
+residues                    :   1532
+molecules                   :    975
+Atom type names             :    190
+SYBYL type information      :    190
+excluded atom list          :   5801
+
+qprep> 
+
+PDB file successfully written.
+
+qprep> ---------------------------- Reading topology file ---------------------------
+MKC_p                                                                           
+
+No. of solute atoms     =       9126
+No. of solvent atoms    =       2913
+No. of coordinates      =      36117
+No. of atom type codes  =      12039
+No. of solute bonds     =       9244
+No. of solvent bonds    =       2913
+No. of solute angles    =      16716
+No. of solvent angles   =       2913
+No. of solute torsions  =      39317
+No. of solvent torsions =          0
+No. of solute impropers =       1767
+No. of solvent impropers=          0
+No. of atomic charges   =      12039
+No. of solute chargegrps=        200
+No. of solvent chargegps=        971
+Charge group cut-off    : Any atoms
+vdW  rule [ 1=G / 2=A ] =          2
+El-static 1-4 damping   =      0.833
+Coulomb constant        =   332.0000
+No. of atom types       =        190
+No. of LJ type 2 pairs  =          0
+No. of heavy atoms      =       5499
+No. of 1-4 neighbours   =      24382
+No. long-range 1-4 nbrs =         69
+No. of nbor exclusions  =      31707
+No. of long-range excls =         79
+No. of residues         =       1532
+No of solute residues   =        561
+No. of molecules        =        975
+Atom type names         =        190
+SYBYL atom types        =        190
+Boundary: sphere
+Exclusion radius        =     25.000
+Eff. solvent radius     =     23.330
+Solute center           =      0.736    26.728     8.942
+Solvent center          =      0.736    26.728     8.942
+No. of excluded atoms   =       5801
+Molecular topology read successfully.
+
+qprep> The current mask contains 12039 atoms.
+Mask cleared.
+qprep> The current mask contains     0 atoms.
+  6238 atoms added to mask which now contains  6238 atoms.
+qprep> 
+
+PDB file successfully written.
+
+qprep> 
