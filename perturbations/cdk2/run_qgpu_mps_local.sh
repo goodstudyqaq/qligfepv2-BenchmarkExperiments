@@ -16,6 +16,7 @@ METRIC_INTERVAL="${METRIC_INTERVAL:-5}"
 METRICS_DIR="${METRICS_DIR:-$CDK2_DIR/metrics}"
 RAW_METRICS_DIR="$METRICS_DIR/raw"
 SUMMARY_FILE="$METRICS_DIR/cdk2_qgpu_mps_summary.tsv"
+STATUS_FILE="$METRICS_DIR/current_status.tsv"
 
 USE_MPS="${USE_MPS:-1}"
 CLEAN_AFTER="${CLEAN_AFTER:-1}"
@@ -29,6 +30,8 @@ GPU_HAS_POWER=1
 MPS_STARTED=0
 ACTIVE_SAMPLERS=()
 ACTIVE_WORKERS=()
+
+exec 3>&1
 
 usage() {
     cat <<'EOF'
@@ -57,7 +60,12 @@ EOF
 }
 
 log() {
-    printf '[%s] %s\n' "$(date -Iseconds)" "$*"
+    local line
+    line="[$(date -Iseconds)] $*"
+    printf '%s\n' "$line"
+    if [[ "${DUPLICATE_LOG_TO_MAIN:-0}" == "1" ]]; then
+        printf '%s\n' "$line" >&3
+    fi
 }
 
 die() {
@@ -125,6 +133,9 @@ init_metrics() {
             $'fep_id\tsystem\tfep_path\tstart_time\tend_time\twall_sec\tstatus\treplicates_done\tcpu_samples\tgpu_samples\tcpu_avg_pct_cores\tcpu_peak_pct_cores\tcpu_avg_pct_node\tcpu_peak_pct_node\trss_avg_mb\trss_peak_mb\tgpu_avg_pct\tgpu_peak_pct\tgpu_mem_util_avg_pct\tgpu_mem_util_peak_pct\tgpu_mem_used_avg_mb\tgpu_mem_used_peak_mb\tgpu_power_avg_w\tgpu_power_peak_w' \
             > "$SUMMARY_FILE"
     fi
+    printf '%s\n' \
+        $'timestamp\tfep_id\tsystem\telapsed_sec\tstatus\trunning_replicates\tdone_replicates\tfailed_replicates\tgpu_util_pct\tgpu_mem_used_mb\tgpu_mem_total_mb\tgpu_power_w' \
+        > "$STATUS_FILE"
 }
 
 collect_process_tree() {
@@ -301,6 +312,76 @@ sample_gpu() {
     done
 }
 
+query_gpu_status() {
+    local gpu_id="$1"
+    local query line
+
+    if ((GPU_HAS_POWER)); then
+        query='utilization.gpu,memory.used,memory.total,power.draw'
+    else
+        query='utilization.gpu,memory.used,memory.total'
+    fi
+
+    if line="$(nvidia-smi -i "$gpu_id" --query-gpu="$query" --format=csv,noheader,nounits 2>/dev/null | head -n 1)"; then
+        if ((GPU_HAS_POWER)); then
+            printf '%s\n' "$line" | awk -F',' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/^[ \t]+|[ \t]+$/, "", $3); gsub(/^[ \t]+|[ \t]+$/, "", $4); printf "%s\t%s\t%s\t%s", $1, $2, $3, $4}'
+        else
+            printf '%s\n' "$line" | awk -F',' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/^[ \t]+|[ \t]+$/, "", $3); printf "%s\t%s\t%s\tNA", $1, $2, $3}'
+        fi
+    else
+        printf 'NA\tNA\tNA\tNA'
+    fi
+}
+
+write_current_status_snapshot() {
+    local output="$1"
+    local fep_name="$2"
+    local system_label="$3"
+    local start_epoch="$4"
+    local status="$5"
+    local rep_raw="$6"
+    shift 6
+    local pids=("$@")
+    local timestamp elapsed running done failed gpu_fields tmp pid
+
+    timestamp="$(date -Iseconds)"
+    elapsed="$(($(date +%s) - start_epoch))"
+    running=0
+    for pid in "${pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            running=$((running + 1))
+        fi
+    done
+
+    done="$(awk -F'\t' 'NR > 1 && $4 == "ok" {count++} END {print count + 0}' "$rep_raw" 2>/dev/null || printf '0')"
+    failed="$(awk -F'\t' 'NR > 1 && $4 == "failed" {count++} END {print count + 0}' "$rep_raw" 2>/dev/null || printf '0')"
+    gpu_fields="$(query_gpu_status "$GPU_ID")"
+    tmp="$output.$BASHPID.tmp"
+
+    {
+        printf '%s\n' $'timestamp\tfep_id\tsystem\telapsed_sec\tstatus\trunning_replicates\tdone_replicates\tfailed_replicates\tgpu_util_pct\tgpu_mem_used_mb\tgpu_mem_total_mb\tgpu_power_w'
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$timestamp" "$fep_name" "$system_label" "$elapsed" "$status" "$running" "$done" "$failed" "$gpu_fields"
+    } > "$tmp"
+    mv "$tmp" "$output"
+}
+
+sample_current_status() {
+    local output="$1"
+    local interval="$2"
+    local fep_name="$3"
+    local system_label="$4"
+    local start_epoch="$5"
+    local rep_raw="$6"
+    shift 6
+    local pids=("$@")
+
+    while true; do
+        write_current_status_snapshot "$output" "$fep_name" "$system_label" "$start_epoch" "running" "$rep_raw" "${pids[@]}"
+        sleep "$interval"
+    done
+}
+
 cpu_stats() {
     local file="$1"
     awk -F',' '
@@ -380,23 +461,30 @@ run_qdyn_step() {
     local input="$1"
     local base="${input%.inp}"
     local start end rc
+    local fep_name="${CURRENT_FEP_NAME:-unknown_fep}"
+    local system_label="${CURRENT_SYSTEM_LABEL:-unknown_system}"
+    local replicate="${CURRENT_REPLICATE:-unknown_rep}"
 
     start="$(date +%s)"
-    log "qdyn --gpu $input"
+    log "START fep=$fep_name system=$system_label rep=$replicate step=$input"
     set +e
     "$QDYN" --gpu "$input" > "${base}.log" 2> "${base}.err"
     rc=$?
     set -e
     end="$(date +%s)"
     printf '%s\t%s\t%s\t%s\t%s\n' "$input" "$start" "$end" "$((end - start))" "$rc" >> qgpu_steps.tsv
+    log "DONE fep=$fep_name system=$system_label rep=$replicate step=$input wall_sec=$((end - start)) exit_code=$rc"
     return "$rc"
 }
 
 run_qfep_step() {
     local start end rc
+    local fep_name="${CURRENT_FEP_NAME:-unknown_fep}"
+    local system_label="${CURRENT_SYSTEM_LABEL:-unknown_system}"
+    local replicate="${CURRENT_REPLICATE:-unknown_rep}"
 
     start="$(date +%s)"
-    log "qfep"
+    log "START fep=$fep_name system=$system_label rep=$replicate step=qfep.inp"
     set +e
     if command -v timeout >/dev/null; then
         timeout 3m "$QFEP" < qfep.inp > qfep.out 2> qfep.err
@@ -408,6 +496,7 @@ run_qfep_step() {
     set -e
     end="$(date +%s)"
     printf '%s\t%s\t%s\t%s\t%s\n' "qfep.inp" "$start" "$end" "$((end - start))" "$rc" >> qgpu_steps.tsv
+    log "DONE fep=$fep_name system=$system_label rep=$replicate step=qfep.inp wall_sec=$((end - start)) exit_code=$rc"
 
     [[ "$rc" -eq 0 || "$rc" -eq 124 ]]
 }
@@ -456,6 +545,9 @@ run_replicate() {
     shift 5
     local inputs=("$@")
     local rundir input
+    CURRENT_FEP_NAME="$(basename "$fep_root")"
+    CURRENT_SYSTEM_LABEL="$(system_label_from_path "$fep_root")"
+    CURRENT_REPLICATE="$run_num"
 
     rundir="$(stage_replicate_inputs "$fep_root" "$run_num" "$temperature" "$seed" "$fepfile")"
 
@@ -483,7 +575,7 @@ run_system() {
     local start_epoch end_epoch start_iso end_iso status wall_sec
     local seeds=() temperatures=() fepfiles=() inputs=()
     local worker_pids=() worker_reps=()
-    local cpu_sampler_pid gpu_sampler_pid done_count=0 failures=0
+    local cpu_sampler_pid gpu_sampler_pid status_sampler_pid done_count=0 failures=0
 
     fep_root="$(cd "$fep_root" && pwd)"
     fep_name="$(basename "$fep_root")"
@@ -518,6 +610,7 @@ run_system() {
         local seed="${seeds[$((run_num - 1))]}"
         local runner_log="$RAW_METRICS_DIR/$tag.replicate_$(printf '%02d' "$run_num").runner.log"
         (
+            DUPLICATE_LOG_TO_MAIN=1
             run_replicate "$fep_root" "$run_num" "${temperatures[0]}" "$seed" "${fepfiles[0]}" "${inputs[@]}"
         ) > "$runner_log" 2>&1 &
         worker_pids+=("$!")
@@ -529,7 +622,9 @@ run_system() {
     cpu_sampler_pid="$!"
     sample_gpu "$gpu_raw" "$METRIC_INTERVAL" "$GPU_ID" &
     gpu_sampler_pid="$!"
-    ACTIVE_SAMPLERS=("$cpu_sampler_pid" "$gpu_sampler_pid")
+    sample_current_status "$STATUS_FILE" "$METRIC_INTERVAL" "$fep_name" "$system_label" "$start_epoch" "$rep_raw" "${worker_pids[@]}" &
+    status_sampler_pid="$!"
+    ACTIVE_SAMPLERS=("$cpu_sampler_pid" "$gpu_sampler_pid" "$status_sampler_pid")
 
     for idx in "${!worker_pids[@]}"; do
         local pid="${worker_pids[$idx]}"
@@ -548,8 +643,8 @@ run_system() {
         fi
     done
 
-    kill "$cpu_sampler_pid" "$gpu_sampler_pid" 2>/dev/null || true
-    wait "$cpu_sampler_pid" "$gpu_sampler_pid" 2>/dev/null || true
+    kill "$cpu_sampler_pid" "$gpu_sampler_pid" "$status_sampler_pid" 2>/dev/null || true
+    wait "$cpu_sampler_pid" "$gpu_sampler_pid" "$status_sampler_pid" 2>/dev/null || true
     ACTIVE_SAMPLERS=()
     ACTIVE_WORKERS=()
 
@@ -561,6 +656,7 @@ run_system() {
     else
         status="ok"
     fi
+    write_current_status_snapshot "$STATUS_FILE" "$fep_name" "$system_label" "$start_epoch" "$status" "$rep_raw" "${worker_pids[@]}"
 
     local cpu_summary gpu_summary
     cpu_summary="$(cpu_stats "$cpu_raw")"
