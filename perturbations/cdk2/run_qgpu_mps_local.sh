@@ -19,6 +19,7 @@ SUMMARY_FILE="$METRICS_DIR/cdk2_qgpu_mps_summary.tsv"
 
 USE_MPS="${USE_MPS:-1}"
 CLEAN_AFTER="${CLEAN_AFTER:-1}"
+KEEP_QFEP_ONLY="${KEEP_QFEP_ONLY:-1}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
 
 ONLY=""
@@ -48,7 +49,8 @@ Environment:
   CUDA_VISIBLE_DEVICES=0              GPU visible to qdyn.
   METRIC_INTERVAL=5                   Sampling interval in seconds.
   MPS_ACTIVE_THREAD_PERCENTAGE=10     Optional per-client MPS SM percentage cap.
-  CLEAN_AFTER=1                       Remove *.dcd and *.inp from each replicate run directory after qfep.
+  CLEAN_AFTER=1                       Clean each replicate run directory after successful qfep.
+  KEEP_QFEP_ONLY=1                    With CLEAN_AFTER=1, keep only qfep.out in each replicate run directory.
   CONTINUE_ON_ERROR=0                 Continue to next system after a failed system.
   USE_MPS=1                           Start a private MPS daemon.
 EOF
@@ -410,6 +412,14 @@ run_qfep_step() {
     [[ "$rc" -eq 0 || "$rc" -eq 124 ]]
 }
 
+cleanup_replicate_outputs() {
+    if [[ "$KEEP_QFEP_ONLY" == "1" ]]; then
+        find . -maxdepth 1 -type f ! -name 'qfep.out' -delete
+    else
+        rm -f ./*.dcd ./*.inp
+    fi
+}
+
 stage_replicate_inputs() {
     local fep_root="$1"
     local run_num="$2"
@@ -460,7 +470,7 @@ run_replicate() {
         run_qfep_step
 
         if [[ "$CLEAN_AFTER" == "1" ]]; then
-            rm -f ./*.dcd ./*.inp
+            cleanup_replicate_outputs
         fi
 
         log "Finished replicate $run_num in $rundir"
