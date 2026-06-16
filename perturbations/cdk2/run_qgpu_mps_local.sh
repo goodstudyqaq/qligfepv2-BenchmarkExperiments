@@ -18,7 +18,6 @@ RAW_METRICS_DIR="$METRICS_DIR/raw"
 SUMMARY_FILE="$METRICS_DIR/cdk2_qgpu_mps_summary.tsv"
 STATUS_FILE="$METRICS_DIR/current_status.tsv"
 
-USE_MPS="${USE_MPS:-1}"
 CLEAN_AFTER="${CLEAN_AFTER:-1}"
 KEEP_QFEP_ONLY="${KEEP_QFEP_ONLY:-1}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
@@ -27,7 +26,6 @@ ONLY=""
 LIMIT=0
 DRY_RUN=0
 GPU_HAS_POWER=1
-MPS_STARTED=0
 ACTIVE_SAMPLERS=()
 ACTIVE_WORKERS=()
 
@@ -42,7 +40,6 @@ Options:
   --only VALUE       Run one FEP pair by name, e.g. FEP_1h1q_1oiu, or one system path.
   --limit N         Run the first N FEP pairs in the default order.
   --dry-run         Print execution order without running qdyn.
-  --no-mps          Do not start a private MPS daemon.
   -h, --help        Show this help.
 
 Environment:
@@ -51,11 +48,9 @@ Environment:
   GPU_ID=0                            GPU passed to nvidia-smi; also used for CUDA_VISIBLE_DEVICES if unset.
   CUDA_VISIBLE_DEVICES=0              GPU visible to qdyn.
   METRIC_INTERVAL=5                   Sampling interval in seconds.
-  MPS_ACTIVE_THREAD_PERCENTAGE=10     Optional per-client MPS SM percentage cap.
   CLEAN_AFTER=1                       Clean each replicate run directory after successful qfep.
   KEEP_QFEP_ONLY=1                    With CLEAN_AFTER=1, keep only qfep.out in each replicate run directory.
   CONTINUE_ON_ERROR=0                 Continue to next system after a failed system.
-  USE_MPS=1                           Start a private MPS daemon.
 EOF
 }
 
@@ -91,10 +86,6 @@ parse_args() {
                 DRY_RUN=1
                 shift
                 ;;
-            --no-mps)
-                USE_MPS=0
-                shift
-                ;;
             -h|--help)
                 usage
                 exit 0
@@ -116,10 +107,6 @@ require_runtime_commands() {
     [[ -x "$QDYN" ]] || die "QDYN is not executable: $QDYN"
     [[ -x "$QFEP" ]] || die "QFEP is not executable: $QFEP"
     command -v nvidia-smi >/dev/null || die "nvidia-smi is required"
-
-    if ((USE_MPS)); then
-        command -v nvidia-cuda-mps-control >/dev/null || die "nvidia-cuda-mps-control is required, or use --no-mps"
-    fi
 
     if ! nvidia-smi -i "$GPU_ID" --query-gpu=power.draw --format=csv,noheader,nounits >/dev/null 2>&1; then
         GPU_HAS_POWER=0
@@ -183,29 +170,7 @@ cleanup() {
         wait "${ACTIVE_WORKERS[@]}" 2>/dev/null || true
     fi
 
-    if ((MPS_STARTED)); then
-        echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
-    fi
-
     exit "$rc"
-}
-
-start_mps() {
-    ((USE_MPS)) || return 0
-
-    export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps-${USER:-user}-$$}"
-    export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log-${USER:-user}-$$}"
-    mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
-
-    if [[ -n "${MPS_ACTIVE_THREAD_PERCENTAGE:-}" ]]; then
-        export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="$MPS_ACTIVE_THREAD_PERCENTAGE"
-        log "MPS active thread percentage per client: $CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
-    fi
-
-    log "Starting MPS on CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-    nvidia-cuda-mps-control -d
-    MPS_STARTED=1
-    sleep 1
 }
 
 system_label_from_path() {
@@ -725,7 +690,6 @@ main() {
 
     require_runtime_commands
     init_metrics
-    start_mps
 
     log "QDYN=$QDYN"
     log "QFEP=$QFEP"
