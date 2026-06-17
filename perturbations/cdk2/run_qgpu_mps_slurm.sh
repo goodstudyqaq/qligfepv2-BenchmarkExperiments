@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${QGPU_SCRIPT_DIR:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUNNER="${QGPU_SCRIPT_DIR:-$SCRIPT_DIR}/run_qgpu_mps_local.sh"
