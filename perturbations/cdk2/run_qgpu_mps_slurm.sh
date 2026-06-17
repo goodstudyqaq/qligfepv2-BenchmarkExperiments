@@ -5,7 +5,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-RUNNER="$SCRIPT_DIR/run_qgpu_mps_local.sh"
+RUNNER="${QGPU_SCRIPT_DIR:-$SCRIPT_DIR}/run_qgpu_mps_local.sh"
 
 JOB_NAME="${JOB_NAME:-cdk2-qgpu}"
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
@@ -195,7 +195,7 @@ submit_array() {
         "--chdir=$SCRIPT_DIR"
         "--array=$array_spec"
         "--output=$LOG_DIR/%x.%A_%a.log"
-        "--export=ALL,QGPU_TARGET_LIST=$target_list"
+        "--export=ALL,QGPU_TARGET_LIST=$target_list,QGPU_SCRIPT_DIR=$SCRIPT_DIR"
     )
 
     [[ -n "$SBATCH_PARTITION" ]] && sbatch_args+=("--partition=$SBATCH_PARTITION")
