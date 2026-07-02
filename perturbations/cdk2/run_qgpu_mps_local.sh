@@ -10,8 +10,6 @@ QDYN="${QDYN:-/home/mcpi-02/code/Q/bin/qdyn}"
 QFEP="${QFEP:-/home/mcpi-02/code/Q/src/q6/bin/q6/qfep}"
 QGPU_MODULES="${QGPU_MODULES-OpenMPI/4.1.4-GCC-11.3.0 CUDA/12.6.0}"
 QGPU_MODULE_PURGE="${QGPU_MODULE_PURGE:-0}"
-QGPU_LIBSTDCXX_DIR="${QGPU_LIBSTDCXX_DIR:-auto}"
-QGPU_REQUIRED_GLIBCXX="${QGPU_REQUIRED_GLIBCXX:-GLIBCXX_3.4.29}"
 GPU_ID="${GPU_ID:-${CUDA_VISIBLE_DEVICES:-0}}"
 GPU_ID="${GPU_ID%%,*}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$GPU_ID}"
@@ -59,9 +57,6 @@ Environment:
   QGPU_MODULES="OpenMPI/4.1.4-GCC-11.3.0 CUDA/12.6.0"
                                       Runtime modules loaded before running qdyn. Set to empty to disable.
   QGPU_MODULE_PURGE=0                 Set to 1 to run module purge before loading QGPU_MODULES.
-  QGPU_LIBSTDCXX_DIR=auto             Directory containing libstdc++.so.6, or auto/empty.
-  QGPU_REQUIRED_GLIBCXX=GLIBCXX_3.4.29
-                                      Required C++ runtime symbol checked before running qdyn.
   GPU_ID=0                            GPU passed to nvidia-smi; also used for CUDA_VISIBLE_DEVICES if unset.
   CUDA_VISIBLE_DEVICES=0              GPU visible to qdyn.
   METRIC_INTERVAL=5                   Sampling interval in seconds.
@@ -167,92 +162,11 @@ init_environment_modules() {
     done
 }
 
-libstdcxx_has_required_symbol() {
-    local dir="$1"
-    local lib="$dir/libstdc++.so.6"
-
-    [[ -r "$lib" ]] || return 1
-    strings "$lib" 2>/dev/null | grep -qx "$QGPU_REQUIRED_GLIBCXX"
-}
-
-prepend_ld_library_path() {
-    local dir="$1"
-
-    case ":${LD_LIBRARY_PATH:-}:" in
-        *":$dir:"*) ;;
-        *)
-            if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
-                export LD_LIBRARY_PATH="$dir:$LD_LIBRARY_PATH"
-            else
-                export LD_LIBRARY_PATH="$dir"
-            fi
-            ;;
-    esac
-}
-
-configure_libstdcxx_runtime() {
-    local qdyn_dir qdyn_root script_user_root qdyn_user_root
-    local candidates=()
-    local dir resolved resolved_path root
-    local roots=()
-
-    command -v strings >/dev/null || die "strings is required to check libstdc++ runtime compatibility"
+log_qdyn_runtime_libraries() {
+    local resolved
     command -v ldd >/dev/null || die "ldd is required to check qdyn runtime libraries"
-
-    if [[ -n "$QGPU_LIBSTDCXX_DIR" && "$QGPU_LIBSTDCXX_DIR" != "auto" ]]; then
-        libstdcxx_has_required_symbol "$QGPU_LIBSTDCXX_DIR" || die "QGPU_LIBSTDCXX_DIR does not contain libstdc++.so.6 with $QGPU_REQUIRED_GLIBCXX: $QGPU_LIBSTDCXX_DIR"
-        prepend_ld_library_path "$QGPU_LIBSTDCXX_DIR"
-        log "Using libstdc++ runtime from QGPU_LIBSTDCXX_DIR=$QGPU_LIBSTDCXX_DIR"
-    elif [[ "$QGPU_LIBSTDCXX_DIR" == "auto" ]]; then
-        resolved="$(ldd "$QDYN" 2>/dev/null | awk '/libstdc\+\+/{print; exit}' || true)"
-        [[ -n "$resolved" ]] && log "Initial QDYN libstdc++ resolution: $resolved"
-        resolved_path="$(printf '%s\n' "$resolved" | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^\//) {print $i; exit}}')"
-
-        if [[ -n "$resolved_path" ]] && libstdcxx_has_required_symbol "$(dirname "$resolved_path")"; then
-            log "Current libstdc++ runtime already provides $QGPU_REQUIRED_GLIBCXX"
-            return 0
-        fi
-
-        qdyn_dir="$(cd -P "$(dirname "$QDYN")" 2>/dev/null && pwd || true)"
-        if [[ -n "$qdyn_dir" ]]; then
-            qdyn_root="$(cd "$qdyn_dir/.." 2>/dev/null && pwd || true)"
-            [[ -n "$qdyn_root" ]] && candidates+=("$qdyn_root/lib")
-            qdyn_user_root="$(cd "$qdyn_dir/../../.." 2>/dev/null && pwd || true)"
-            [[ -n "$qdyn_user_root" ]] && roots+=("$qdyn_user_root")
-        fi
-        script_user_root="$(cd "$SCRIPT_DIR/../../../.." 2>/dev/null && pwd || true)"
-        [[ -n "$script_user_root" ]] && roots+=("$script_user_root")
-        [[ -n "${HOME:-}" ]] && roots+=("$HOME")
-
-        [[ -n "${CONDA_PREFIX:-}" ]] && candidates+=("$CONDA_PREFIX/lib")
-        [[ -n "${MAMBA_ROOT_PREFIX:-}" ]] && candidates+=("$MAMBA_ROOT_PREFIX/envs/qligfep_new/lib" "$MAMBA_ROOT_PREFIX/lib")
-        for root in "${roots[@]}"; do
-            candidates+=(
-                "$root/micromamba/envs/qligfep_new/lib"
-                "$root/micromamba/envs/qligfepv2/lib"
-                "$root/micromamba/lib"
-                "$root/anaconda3/envs/qligfep_new/lib"
-                "$root/anaconda3/envs/qligfepv2/lib"
-                "$root/anaconda3/lib"
-            )
-        done
-
-        for dir in "${candidates[@]}"; do
-            if libstdcxx_has_required_symbol "$dir"; then
-                prepend_ld_library_path "$dir"
-                log "Auto-selected libstdc++ runtime: $dir"
-                break
-            fi
-        done
-    fi
-
     resolved="$(ldd "$QDYN" 2>/dev/null | awk '/libstdc\+\+/{print; exit}' || true)"
     [[ -n "$resolved" ]] && log "QDYN libstdc++ resolution: $resolved"
-    resolved_path="$(printf '%s\n' "$resolved" | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^\//) {print $i; exit}}')"
-
-    if [[ -n "$resolved_path" ]] && ! libstdcxx_has_required_symbol "$(dirname "$resolved_path")"; then
-        die "QDYN resolved libstdc++ without $QGPU_REQUIRED_GLIBCXX: $resolved_path. Set QGPU_LIBSTDCXX_DIR to a directory containing a newer libstdc++.so.6, for example a conda/micromamba env lib directory."
-    fi
 }
 
 require_runtime_commands() {
@@ -924,7 +838,7 @@ main() {
     fi
 
     init_environment_modules
-    configure_libstdcxx_runtime
+    log_qdyn_runtime_libraries
     require_runtime_commands
     init_metrics
 
