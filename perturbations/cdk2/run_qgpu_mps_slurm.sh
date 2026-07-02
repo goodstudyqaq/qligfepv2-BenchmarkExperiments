@@ -22,6 +22,7 @@ SBATCH_ARRAY_MAX_CONCURRENT="${SBATCH_ARRAY_MAX_CONCURRENT:-}"
 
 ONLY=""
 LIMIT=0
+SYSTEM_FILTER="both"
 SUBMIT_DRY_RUN=0
 MPS_STARTED=0
 
@@ -32,10 +33,11 @@ Usage:
 
 Submits one Slurm array task per FEP edge. Each task requests one GPU,
 starts a private MPS daemon inside the Slurm allocation, then runs:
-  ./run_qgpu_mps_local.sh --only EDGE
+  ./run_qgpu_mps_local.sh --only EDGE --system VALUE
 
 Options:
   --only VALUE       Submit one FEP edge by name, e.g. FEP_1h1q_1oiu, or one system path.
+  --system VALUE     For FEP names, submit protein, water, or both. Default: both.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
   -h, --help        Show this help.
@@ -78,6 +80,12 @@ parse_args() {
                 ONLY="$2"
                 shift 2
                 ;;
+            --system)
+                [[ $# -ge 2 ]] || die "--system requires protein, water, or both"
+                SYSTEM_FILTER="$2"
+                [[ "$SYSTEM_FILTER" == "protein" || "$SYSTEM_FILTER" == "water" || "$SYSTEM_FILTER" == "both" ]] || die "--system must be protein, water, or both"
+                shift 2
+                ;;
             --limit)
                 [[ $# -ge 2 ]] || die "--limit requires a value"
                 LIMIT="$2"
@@ -118,10 +126,18 @@ resolve_one_target() {
 validate_target() {
     local target="$1"
     local system_dir
+    local system_dirs=()
+
+    case "$SYSTEM_FILTER" in
+        protein) system_dirs=(2.protein) ;;
+        water) system_dirs=(1.water) ;;
+        both) system_dirs=(2.protein 1.water) ;;
+        *) die "--system must be protein, water, or both" ;;
+    esac
 
     if [[ "$target" == FEP_* ]]; then
-        for system_dir in 2.protein 1.water; do
-            [[ -d "$SCRIPT_DIR/$system_dir/$target/inputfiles" ]] || die "Missing paired system path: $SCRIPT_DIR/$system_dir/$target"
+        for system_dir in "${system_dirs[@]}"; do
+            [[ -d "$SCRIPT_DIR/$system_dir/$target/inputfiles" ]] || die "Missing system path: $SCRIPT_DIR/$system_dir/$target"
         done
     else
         [[ -d "$target/inputfiles" ]] || die "Missing inputfiles directory for target path: $target"
@@ -282,7 +298,7 @@ run_array_task() {
     start_mps
 
     set +e
-    "$RUNNER" --only "$target"
+    "$RUNNER" --only "$target" --system "$SYSTEM_FILTER"
     rc=$?
     set -e
 
