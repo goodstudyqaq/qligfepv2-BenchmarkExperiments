@@ -6,8 +6,8 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CDK2_DIR="$SCRIPT_DIR"
 
-QDYN="${QDYN:-/home/shen/code/Q2/bin/qdyn}"
-QFEP="${QFEP:-/home/shen/code/Q2/src/q6/bin/q6/qfep}"
+QDYN="${QDYN:-/home/mcpi-02/code/Q/bin/qdyn}"
+QFEP="${QFEP:-/home/mcpi-02/code/Q/src/q6/bin/q6/qfep}"
 GPU_ID="${GPU_ID:-${CUDA_VISIBLE_DEVICES:-0}}"
 GPU_ID="${GPU_ID%%,*}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$GPU_ID}"
@@ -17,14 +17,19 @@ METRICS_DIR="${METRICS_DIR:-$CDK2_DIR/metrics}"
 RAW_METRICS_DIR="$METRICS_DIR/raw"
 SUMMARY_FILE="$METRICS_DIR/cdk2_qgpu_mps_summary.tsv"
 STATUS_FILE="$METRICS_DIR/current_status.tsv"
+QDYN_FAILURE_LOG_LINES="${QDYN_FAILURE_LOG_LINES:-120}"
+QDYN_FAILURE_ERR_LINES="${QDYN_FAILURE_ERR_LINES:-80}"
 
 CLEAN_AFTER="${CLEAN_AFTER:-1}"
 KEEP_QFEP_ONLY="${KEEP_QFEP_ONLY:-1}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
+REPLICATES="${REPLICATES:-10}"
+QGPU_DISABLE_WATER_POLX="${QGPU_DISABLE_WATER_POLX:-0}"
 
 ONLY=""
 LIMIT=0
 DRY_RUN=0
+SYSTEM_FILTER="both"
 GPU_HAS_POWER=1
 ACTIVE_SAMPLERS=()
 ACTIVE_WORKERS=()
@@ -38,19 +43,25 @@ Usage:
 
 Options:
   --only VALUE       Run one FEP pair by name, e.g. FEP_1h1q_1oiu, or one system path.
+  --system VALUE     For FEP names, run protein, water, or both. Default: both.
+  --replicates N    Run the first N replicates concurrently. Default: 10.
   --limit N         Run the first N FEP pairs in the default order.
   --dry-run         Print execution order without running qdyn.
   -h, --help        Show this help.
 
 Environment:
-  QDYN=/path/to/qdyn                  Default: /home/shen/code/Q2/bin/qdyn
-  QFEP=/path/to/qfep                  Default: /home/shen/code/Q2/src/q6/bin/q6/qfep
+  QDYN=/path/to/qdyn                  Default: /home/mcpi-02/code/Q/bin/qdyn
+  QFEP=/path/to/qfep                  Default: /home/mcpi-02/code/Q/src/q6/bin/q6/qfep
   GPU_ID=0                            GPU passed to nvidia-smi; also used for CUDA_VISIBLE_DEVICES if unset.
   CUDA_VISIBLE_DEVICES=0              GPU visible to qdyn.
   METRIC_INTERVAL=5                   Sampling interval in seconds.
   CLEAN_AFTER=1                       Clean each replicate run directory after successful qfep.
   KEEP_QFEP_ONLY=1                    With CLEAN_AFTER=1, keep only qfep.out in each replicate run directory.
   CONTINUE_ON_ERROR=0                 Continue to next system after a failed system.
+  REPLICATES=10                        Number of replicates to run when --replicates is not set.
+  QGPU_DISABLE_WATER_POLX=0           Diagnostic only: turn water input polarisation off in staged copies.
+  QDYN_FAILURE_LOG_LINES=120          Lines of failed qdyn stdout log copied into the runner log.
+  QDYN_FAILURE_ERR_LINES=80           Lines of failed qdyn stderr log copied into the runner log.
 EOF
 }
 
@@ -76,6 +87,18 @@ parse_args() {
                 ONLY="$2"
                 shift 2
                 ;;
+            --system)
+                [[ $# -ge 2 ]] || die "--system requires protein, water, or both"
+                SYSTEM_FILTER="$2"
+                [[ "$SYSTEM_FILTER" == "protein" || "$SYSTEM_FILTER" == "water" || "$SYSTEM_FILTER" == "both" ]] || die "--system must be protein, water, or both"
+                shift 2
+                ;;
+            --replicates)
+                [[ $# -ge 2 ]] || die "--replicates requires a value"
+                REPLICATES="$2"
+                [[ "$REPLICATES" =~ ^[1-9][0-9]*$ ]] || die "--replicates must be a positive integer"
+                shift 2
+                ;;
             --limit)
                 [[ $# -ge 2 ]] || die "--limit requires a value"
                 LIMIT="$2"
@@ -95,6 +118,8 @@ parse_args() {
                 ;;
         esac
     done
+    [[ "$REPLICATES" =~ ^[1-9][0-9]*$ ]] || die "REPLICATES must be a positive integer"
+    [[ "$QGPU_DISABLE_WATER_POLX" == "0" || "$QGPU_DISABLE_WATER_POLX" == "1" ]] || die "QGPU_DISABLE_WATER_POLX must be 0 or 1"
 }
 
 require_runtime_commands() {
@@ -422,6 +447,54 @@ gpu_stats() {
     ' "$file"
 }
 
+tail_if_present() {
+    local file="$1"
+    local lines="$2"
+
+    if [[ -s "$file" ]]; then
+        log "BEGIN tail -n $lines $file"
+        tail -n "$lines" "$file" || true
+        log "END tail -n $lines $file"
+    else
+        log "No non-empty failure artifact: $file"
+    fi
+}
+
+input_value() {
+    local input="$1"
+    local key="$2"
+    awk -v key="$key" 'tolower($1) == key {print $2; exit}' "$input" 2>/dev/null || true
+}
+
+summarize_qdyn_failure() {
+    local input="$1"
+    local rc="$2"
+    local base="${input%.inp}"
+    local restart final
+
+    restart="$(input_value "$input" "restart")"
+    final="$(input_value "$input" "final")"
+
+    log "QDyn failed: step=$input exit_code=$rc rundir=$(pwd)"
+    if [[ -n "$restart" ]]; then
+        if [[ -f "$restart" ]]; then
+            log "Input restart exists: $restart"
+        else
+            log "Input restart is missing: $restart"
+        fi
+    fi
+    if [[ -n "$final" ]]; then
+        if [[ -f "$final" ]]; then
+            log "Output restart was written: $final"
+        else
+            log "Output restart was not written: $final"
+        fi
+    fi
+
+    tail_if_present "${base}.err" "$QDYN_FAILURE_ERR_LINES"
+    tail_if_present "${base}.log" "$QDYN_FAILURE_LOG_LINES"
+}
+
 run_qdyn_step() {
     local input="$1"
     local base="${input%.inp}"
@@ -439,6 +512,9 @@ run_qdyn_step() {
     end="$(date +%s)"
     printf '%s\t%s\t%s\t%s\t%s\n' "$input" "$start" "$end" "$((end - start))" "$rc" >> qgpu_steps.tsv
     log "DONE fep=$fep_name system=$system_label rep=$replicate step=$input wall_sec=$((end - start)) exit_code=$rc"
+    if [[ "$rc" -ne 0 ]]; then
+        summarize_qdyn_failure "$input" "$rc"
+    fi
     return "$rc"
 }
 
@@ -482,6 +558,9 @@ stage_replicate_inputs() {
     local fepfile="$5"
     local inputfiles="$fep_root/inputfiles"
     local rundir="$fep_root/FEP1/$temperature/$run_num"
+    local system_label
+
+    system_label="$(system_label_from_path "$fep_root")"
 
     mkdir -p "$rundir"
     cp "$inputfiles"/md*.inp "$rundir"/
@@ -495,6 +574,10 @@ stage_replicate_inputs() {
         sed -i "s/SEED_VAR/$seed/g" eq1.inp
         sed -i "s/T_VAR/$temperature/g" ./*.inp
         sed -i "s/FEP_VAR/$fepfile/g" ./*.inp
+        if [[ "$system_label" == "water" && "$QGPU_DISABLE_WATER_POLX" == "1" ]]; then
+            sed -i -E 's/^([[:space:]]*polarisation[[:space:]]+)on([[:space:]]*)$/\1off\2/' ./*.inp
+            log "Diagnostic mode: set water polarisation off in staged inputs for $rundir" >&2
+        fi
         printf 'step\tstart_epoch\tend_epoch\twall_sec\texit_code\n' > qgpu_steps.tsv
     )
 
@@ -521,10 +604,16 @@ run_replicate() {
         log "Starting replicate $run_num in $rundir, T=$temperature, seed=$seed"
         for input in "${inputs[@]}"; do
             [[ -f "$input" ]] || die "Missing input file in $rundir: $input"
-            run_qdyn_step "$input"
+            if ! run_qdyn_step "$input"; then
+                log "Stopping replicate $run_num after failed qdyn step: $input"
+                return 1
+            fi
         done
 
-        run_qfep_step
+        if ! run_qfep_step; then
+            log "Stopping replicate $run_num after failed qfep step"
+            return 1
+        fi
 
         if [[ "$CLEAN_AFTER" == "1" ]]; then
             cleanup_replicate_outputs
@@ -554,7 +643,8 @@ run_system() {
     read -r -a fepfiles <<< "$(parse_array_assignment "$run_script" "fepfiles")"
     mapfile -t inputs < <(extract_qdyn_inputs "$run_script")
 
-    ((${#seeds[@]} == 10)) || die "$run_script: expected 10 seeds, got ${#seeds[@]}"
+    ((${#seeds[@]} > 0)) || die "$run_script: expected at least 1 seed, got ${#seeds[@]}"
+    ((REPLICATES <= ${#seeds[@]})) || die "$run_script: requested $REPLICATES replicates, but only ${#seeds[@]} seeds are available"
     ((${#temperatures[@]} == 1)) || die "$run_script: expected 1 temperature, got ${#temperatures[@]}"
     ((${#fepfiles[@]} == 1)) || die "$run_script: this local runner currently expects exactly 1 FEP file, got ${#fepfiles[@]}"
     ((${#inputs[@]} > 0)) || die "$run_script: could not extract qdyn input order"
@@ -565,13 +655,13 @@ run_system() {
     gpu_raw="$RAW_METRICS_DIR/$tag.gpu.csv"
     rep_raw="$RAW_METRICS_DIR/$tag.replicates.tsv"
 
-    log "Running $fep_name $system_label with 10 concurrent replicates"
+    log "Running $fep_name $system_label with $REPLICATES concurrent replicate(s)"
     printf 'replicate\tpid\texit_code\tstatus\n' > "$rep_raw"
 
     start_epoch="$(date +%s)"
     start_iso="$(date -Iseconds)"
 
-    for run_num in $(seq 1 10); do
+    for run_num in $(seq 1 "$REPLICATES"); do
         local seed="${seeds[$((run_num - 1))]}"
         local runner_log="$RAW_METRICS_DIR/$tag.replicate_$(printf '%02d' "$run_num").runner.log"
         (
@@ -639,6 +729,14 @@ resolve_targets() {
     local targets=()
     local fep_names=()
     local only_path
+    local system_dirs=()
+
+    case "$SYSTEM_FILTER" in
+        protein) system_dirs=(2.protein) ;;
+        water) system_dirs=(1.water) ;;
+        both) system_dirs=(2.protein 1.water) ;;
+        *) die "--system must be protein, water, or both" ;;
+    esac
 
     if [[ -n "$ONLY" ]]; then
         if [[ -d "$ONLY" ]]; then
@@ -665,7 +763,7 @@ resolve_targets() {
             if ((LIMIT > 0 && count >= LIMIT)); then
                 break
             fi
-            for system_dir in 2.protein 1.water; do
+            for system_dir in "${system_dirs[@]}"; do
                 path="$CDK2_DIR/$system_dir/$fep_name"
                 [[ -d "$path/inputfiles" ]] || die "Missing paired system path: $path"
                 targets+=("$path")
