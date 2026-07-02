@@ -18,13 +18,13 @@ SBATCH_PARTITION="${SBATCH_PARTITION:-}"
 SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-}"
 SBATCH_QOS="${SBATCH_QOS:-}"
 SBATCH_CONSTRAINT="${SBATCH_CONSTRAINT:-}"
-SBATCH_ARRAY_MAX_CONCURRENT="${SBATCH_ARRAY_MAX_CONCURRENT:-1}"
 SBATCH_GPU_BIND="${SBATCH_GPU_BIND:-}"
 
 ONLY=""
 LIMIT=0
 SYSTEM_FILTER="both"
 REPLICATES_OVERRIDE=""
+IGNORED_ARRAY_MAX_CONCURRENT=""
 SUBMIT_DRY_RUN=0
 MPS_STARTED=0
 
@@ -33,16 +33,14 @@ usage() {
 Usage:
   ./run_qgpu_mps_slurm.sh [options]
 
-Submits one Slurm array task per FEP edge. Each task requests one GPU,
+Submits one Slurm job per FEP edge. Each job requests one GPU,
 starts a private MPS daemon inside the Slurm allocation, then runs:
   ./run_qgpu_mps_local.sh --only EDGE --system VALUE
 
 Options:
   --only VALUE       Submit one FEP edge by name, e.g. FEP_1h1q_1oiu, or one system path.
   --system VALUE     For FEP names, submit protein, water, or both. Default: both.
-  --replicates N     Number of concurrent replicas inside each array task. Default: runner default.
-  --array-max-concurrent N
-                     Max concurrent Slurm array tasks. Default: 1.
+  --replicates N     Number of concurrent replicas inside each submitted job. Default: runner default.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
   -h, --help        Show this help.
@@ -59,7 +57,6 @@ Environment:
   SBATCH_ACCOUNT=...                  Optional Slurm account.
   SBATCH_QOS=...                      Optional Slurm QoS.
   SBATCH_CONSTRAINT=...               Optional Slurm constraint.
-  SBATCH_ARRAY_MAX_CONCURRENT=1       Slurm array throttle. Raise to the number of GPUs to use.
   SBATCH_GPU_BIND=single:1            Optional Slurm --gpu-bind value.
   QGPU_METRICS_BASE=./metrics/slurm   Base directory for per-task metrics.
   MPS_ACTIVE_THREAD_PERCENTAGE=10     Optional per-client MPS SM percentage cap.
@@ -101,8 +98,8 @@ parse_args() {
                 ;;
             --array-max-concurrent)
                 [[ $# -ge 2 ]] || die "--array-max-concurrent requires a value"
-                SBATCH_ARRAY_MAX_CONCURRENT="$2"
-                [[ "$SBATCH_ARRAY_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]] || die "--array-max-concurrent must be a positive integer"
+                IGNORED_ARRAY_MAX_CONCURRENT="$2"
+                [[ "$IGNORED_ARRAY_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]] || die "--array-max-concurrent must be a positive integer"
                 shift 2
                 ;;
             --limit)
@@ -188,23 +185,54 @@ resolve_targets() {
     printf '%s\n' "${targets[@]}"
 }
 
-write_target_list() {
-    local target_list
-    mkdir -p "$LOG_DIR"
-    target_list="$(mktemp "$LOG_DIR/qgpu_targets.XXXXXX.txt")"
-    printf '%s\n' "$@" > "$target_list"
-    printf '%s\n' "$target_list"
-}
-
 print_command() {
     printf '%q ' "$@"
     printf '\n'
 }
 
-submit_array() {
+build_sbatch_args() {
+    local target="$1"
+    local tag
+    tag="$(safe_tag "$target")"
+
+    printf '%s\0' \
+        "--job-name=$JOB_NAME" \
+        "--nodes=1" \
+        "--ntasks=1" \
+        "--cpus-per-task=$SBATCH_CPUS_PER_TASK" \
+        "--mem=$SBATCH_MEM" \
+        "--time=$SBATCH_TIME" \
+        "--chdir=$SCRIPT_DIR" \
+        "--output=$LOG_DIR/%x.%j.$tag.log" \
+        "--export=ALL,QGPU_SCRIPT_DIR=$SCRIPT_DIR"
+
+    [[ -n "$SBATCH_PARTITION" ]] && printf '%s\0' "--partition=$SBATCH_PARTITION"
+    [[ -n "$SBATCH_ACCOUNT" ]] && printf '%s\0' "--account=$SBATCH_ACCOUNT"
+    [[ -n "$SBATCH_QOS" ]] && printf '%s\0' "--qos=$SBATCH_QOS"
+    [[ -n "$SBATCH_CONSTRAINT" ]] && printf '%s\0' "--constraint=$SBATCH_CONSTRAINT"
+    [[ -n "$SBATCH_GPU_BIND" ]] && printf '%s\0' "--gpu-bind=$SBATCH_GPU_BIND"
+
+    if [[ -n "$SBATCH_GRES" ]]; then
+        printf '%s\0' "--gres=$SBATCH_GRES"
+    else
+        printf '%s\0' "--gpus-per-node=$SBATCH_GPUS_PER_NODE"
+    fi
+}
+
+build_child_args() {
+    local target="$1"
+
+    printf '%s\0' "$SCRIPT_PATH" "--only" "$target" "--system" "$SYSTEM_FILTER"
+    if [[ -n "$REPLICATES_OVERRIDE" ]]; then
+        printf '%s\0' "--replicates" "$REPLICATES_OVERRIDE"
+    fi
+}
+
+submit_jobs() {
     local targets=()
-    local target_list array_spec
+    local target
     local sbatch_args=()
+    local child_args=()
 
     if (( ! SUBMIT_DRY_RUN )); then
         command -v sbatch >/dev/null || die "sbatch is required"
@@ -212,50 +240,27 @@ submit_array() {
     [[ -x "$RUNNER" ]] || die "Runner is not executable: $RUNNER"
 
     mapfile -t targets < <(resolve_targets)
-    target_list="$(write_target_list "${targets[@]}")"
-
-    array_spec="1-${#targets[@]}"
-    if [[ -n "$SBATCH_ARRAY_MAX_CONCURRENT" ]]; then
-        [[ "$SBATCH_ARRAY_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]] || die "SBATCH_ARRAY_MAX_CONCURRENT must be a positive integer"
-        array_spec="$array_spec%$SBATCH_ARRAY_MAX_CONCURRENT"
-    fi
-
-    sbatch_args=(
-        "--job-name=$JOB_NAME"
-        "--nodes=1"
-        "--ntasks=1"
-        "--cpus-per-task=$SBATCH_CPUS_PER_TASK"
-        "--mem=$SBATCH_MEM"
-        "--time=$SBATCH_TIME"
-        "--chdir=$SCRIPT_DIR"
-        "--array=$array_spec"
-        "--output=$LOG_DIR/%x.%A_%a.log"
-        "--export=ALL,QGPU_TARGET_LIST=$target_list,QGPU_SCRIPT_DIR=$SCRIPT_DIR"
-    )
-
-    [[ -n "$SBATCH_PARTITION" ]] && sbatch_args+=("--partition=$SBATCH_PARTITION")
-    [[ -n "$SBATCH_ACCOUNT" ]] && sbatch_args+=("--account=$SBATCH_ACCOUNT")
-    [[ -n "$SBATCH_QOS" ]] && sbatch_args+=("--qos=$SBATCH_QOS")
-    [[ -n "$SBATCH_CONSTRAINT" ]] && sbatch_args+=("--constraint=$SBATCH_CONSTRAINT")
-    [[ -n "$SBATCH_GPU_BIND" ]] && sbatch_args+=("--gpu-bind=$SBATCH_GPU_BIND")
-
-    if [[ -n "$SBATCH_GRES" ]]; then
-        sbatch_args+=("--gres=$SBATCH_GRES")
-    else
-        sbatch_args+=("--gpus-per-node=$SBATCH_GPUS_PER_NODE")
-    fi
+    mkdir -p "$LOG_DIR"
 
     printf 'Resolved %d target(s):\n' "${#targets[@]}"
     printf '  %s\n' "${targets[@]}"
-    printf 'Target list: %s\n' "$target_list"
-
-    if ((SUBMIT_DRY_RUN)); then
-        printf 'sbatch command:\n  '
-        print_command sbatch "${sbatch_args[@]}" "$SCRIPT_PATH" "$@"
-        return 0
+    if [[ -n "$IGNORED_ARRAY_MAX_CONCURRENT" ]]; then
+        printf 'Note: --array-max-concurrent is ignored because this script now submits independent jobs, not a Slurm array.\n'
     fi
 
-    exec sbatch "${sbatch_args[@]}" "$SCRIPT_PATH" "$@"
+    for target in "${targets[@]}"; do
+        sbatch_args=()
+        child_args=()
+        mapfile -d '' -t sbatch_args < <(build_sbatch_args "$target")
+        mapfile -d '' -t child_args < <(build_child_args "$target")
+
+        if ((SUBMIT_DRY_RUN)); then
+            printf 'sbatch command for %s:\n  ' "$target"
+            print_command sbatch "${sbatch_args[@]}" "${child_args[@]}"
+        else
+            sbatch "${sbatch_args[@]}" "${child_args[@]}"
+        fi
+    done
 }
 
 cleanup() {
@@ -270,10 +275,12 @@ cleanup() {
 }
 
 start_mps() {
+    local task_id
     command -v nvidia-cuda-mps-control >/dev/null || die "nvidia-cuda-mps-control is required"
 
-    export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps-${USER:-user}-${SLURM_JOB_ID}-${SLURM_ARRAY_TASK_ID}}"
-    export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log-${USER:-user}-${SLURM_JOB_ID}-${SLURM_ARRAY_TASK_ID}}"
+    task_id="${SLURM_ARRAY_TASK_ID:-0}"
+    export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps-${USER:-user}-${SLURM_JOB_ID}-${task_id}}"
+    export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log-${USER:-user}-${SLURM_JOB_ID}-${task_id}}"
     mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
 
     if [[ -n "${MPS_ACTIVE_THREAD_PERCENTAGE:-}" ]]; then
@@ -306,27 +313,23 @@ ensure_single_visible_gpu() {
     [[ "$CUDA_VISIBLE_DEVICES" != *,* ]] || die "Expected exactly one visible GPU per array task, got CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 }
 
-run_array_task() {
-    local target tag array_job_id metrics_base rc
+run_job_task() {
+    local target tag metrics_base rc
     local runner_args=()
 
-    [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]] || die "SLURM_ARRAY_TASK_ID is required; submit this script as an array job"
-    [[ -n "${QGPU_TARGET_LIST:-}" ]] || die "QGPU_TARGET_LIST is required"
-    [[ -f "$QGPU_TARGET_LIST" ]] || die "Target list does not exist: $QGPU_TARGET_LIST"
+    [[ -n "$ONLY" ]] || die "This Slurm job must be submitted with --only TARGET"
     [[ -x "$RUNNER" ]] || die "Runner is not executable: $RUNNER"
 
-    target="$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$QGPU_TARGET_LIST")"
-    [[ -n "$target" ]] || die "No target found for SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID"
+    target="$(resolve_one_target)"
     validate_target "$target"
 
     tag="$(safe_tag "$target")"
-    array_job_id="${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}"
     metrics_base="${QGPU_METRICS_BASE:-$SCRIPT_DIR/metrics/slurm}"
-    export METRICS_DIR="$metrics_base/${array_job_id}_${SLURM_ARRAY_TASK_ID}_${tag}"
+    export METRICS_DIR="$metrics_base/${SLURM_JOB_ID}_${tag}"
     mkdir -p "$METRICS_DIR"
 
     log "SLURM_JOB_ID=$SLURM_JOB_ID"
-    log "SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID"
+    log "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-unset}"
     log "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST:-unset}"
     log "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset}"
     log "SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-unset}"
@@ -360,9 +363,9 @@ main() {
     parse_args "$@"
 
     if [[ -z "${SLURM_JOB_ID:-}" ]]; then
-        submit_array "$@"
+        submit_jobs "$@"
     else
-        run_array_task
+        run_job_task
     fi
 }
 

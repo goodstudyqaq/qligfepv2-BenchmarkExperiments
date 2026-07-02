@@ -8,7 +8,7 @@ CDK2_DIR="$SCRIPT_DIR"
 
 QDYN="${QDYN:-/home/mcpi-02/code/Q/bin/qdyn}"
 QFEP="${QFEP:-/home/mcpi-02/code/Q/src/q6/bin/q6/qfep}"
-QGPU_MODULES="${QGPU_MODULES-2023 AOCC/4.0.0-GCCcore-12.3.0 OpenMPI/4.1.5-GCC-12.3.0}"
+QGPU_MODULES="${QGPU_MODULES-}"
 QGPU_MODULE_PURGE="${QGPU_MODULE_PURGE:-0}"
 GPU_ID="${GPU_ID:-${CUDA_VISIBLE_DEVICES:-0}}"
 GPU_ID="${GPU_ID%%,*}"
@@ -54,8 +54,7 @@ Options:
 Environment:
   QDYN=/path/to/qdyn                  Default: /home/mcpi-02/code/Q/bin/qdyn
   QFEP=/path/to/qfep                  Default: /home/mcpi-02/code/Q/src/q6/bin/q6/qfep
-  QGPU_MODULES="2023 AOCC/4.0.0-GCCcore-12.3.0 OpenMPI/4.1.5-GCC-12.3.0"
-                                      Runtime modules loaded before running qdyn. Set to empty to disable.
+  QGPU_MODULES="..."                  Optional runtime modules loaded before running qdyn.
   QGPU_MODULE_PURGE=0                 Set to 1 to run module purge before loading QGPU_MODULES.
   GPU_ID=0                            GPU passed to nvidia-smi; also used for CUDA_VISIBLE_DEVICES if unset.
   CUDA_VISIBLE_DEVICES=0              GPU visible to qdyn.
