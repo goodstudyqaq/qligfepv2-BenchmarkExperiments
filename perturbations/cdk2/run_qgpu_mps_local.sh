@@ -8,6 +8,8 @@ CDK2_DIR="$SCRIPT_DIR"
 
 QDYN="${QDYN:-/home/mcpi-02/code/Q/bin/qdyn}"
 QFEP="${QFEP:-/home/mcpi-02/code/Q/src/q6/bin/q6/qfep}"
+QGPU_MODULES="${QGPU_MODULES-2023 AOCC/4.0.0-GCCcore-12.3.0 OpenMPI/4.1.5-GCC-12.3.0}"
+QGPU_MODULE_PURGE="${QGPU_MODULE_PURGE:-0}"
 GPU_ID="${GPU_ID:-${CUDA_VISIBLE_DEVICES:-0}}"
 GPU_ID="${GPU_ID%%,*}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$GPU_ID}"
@@ -52,6 +54,9 @@ Options:
 Environment:
   QDYN=/path/to/qdyn                  Default: /home/mcpi-02/code/Q/bin/qdyn
   QFEP=/path/to/qfep                  Default: /home/mcpi-02/code/Q/src/q6/bin/q6/qfep
+  QGPU_MODULES="2023 AOCC/4.0.0-GCCcore-12.3.0 OpenMPI/4.1.5-GCC-12.3.0"
+                                      Runtime modules loaded before running qdyn. Set to empty to disable.
+  QGPU_MODULE_PURGE=0                 Set to 1 to run module purge before loading QGPU_MODULES.
   GPU_ID=0                            GPU passed to nvidia-smi; also used for CUDA_VISIBLE_DEVICES if unset.
   CUDA_VISIBLE_DEVICES=0              GPU visible to qdyn.
   METRIC_INTERVAL=5                   Sampling interval in seconds.
@@ -120,6 +125,41 @@ parse_args() {
     done
     [[ "$REPLICATES" =~ ^[1-9][0-9]*$ ]] || die "REPLICATES must be a positive integer"
     [[ "$QGPU_DISABLE_WATER_POLX" == "0" || "$QGPU_DISABLE_WATER_POLX" == "1" ]] || die "QGPU_DISABLE_WATER_POLX must be 0 or 1"
+    [[ "$QGPU_MODULE_PURGE" == "0" || "$QGPU_MODULE_PURGE" == "1" ]] || die "QGPU_MODULE_PURGE must be 0 or 1"
+}
+
+init_environment_modules() {
+    local init_file module_name
+    local module_init_files=(
+        /etc/profile.d/modules.sh
+        /etc/profile.d/lmod.sh
+        /usr/share/Modules/init/bash
+        /usr/share/lmod/lmod/init/bash
+    )
+
+    [[ -n "$QGPU_MODULES" ]] || return 0
+
+    if ! type module >/dev/null 2>&1; then
+        for init_file in "${module_init_files[@]}"; do
+            if [[ -r "$init_file" ]]; then
+                # shellcheck disable=SC1090
+                source "$init_file"
+                break
+            fi
+        done
+    fi
+
+    type module >/dev/null 2>&1 || die "QGPU_MODULES is set, but the environment module command is unavailable"
+
+    if [[ "$QGPU_MODULE_PURGE" == "1" ]]; then
+        log "Purging loaded environment modules"
+        module purge
+    fi
+
+    for module_name in $QGPU_MODULES; do
+        log "Loading runtime module: $module_name"
+        module load "$module_name" || die "Failed to load runtime module: $module_name"
+    done
 }
 
 require_runtime_commands() {
@@ -790,6 +830,7 @@ main() {
         exit 0
     fi
 
+    init_environment_modules
     require_runtime_commands
     init_metrics
 
