@@ -453,7 +453,11 @@ tail_if_present() {
 
     if [[ -s "$file" ]]; then
         log "BEGIN tail -n $lines $file"
-        tail -n "$lines" "$file" || true
+        if [[ "${DUPLICATE_LOG_TO_MAIN:-0}" == "1" ]]; then
+            tail -n "$lines" "$file" | tee /dev/fd/3 || true
+        else
+            tail -n "$lines" "$file" || true
+        fi
         log "END tail -n $lines $file"
     else
         log "No non-empty failure artifact: $file"

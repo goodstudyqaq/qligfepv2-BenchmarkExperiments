@@ -18,11 +18,13 @@ SBATCH_PARTITION="${SBATCH_PARTITION:-}"
 SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-}"
 SBATCH_QOS="${SBATCH_QOS:-}"
 SBATCH_CONSTRAINT="${SBATCH_CONSTRAINT:-}"
-SBATCH_ARRAY_MAX_CONCURRENT="${SBATCH_ARRAY_MAX_CONCURRENT:-}"
+SBATCH_ARRAY_MAX_CONCURRENT="${SBATCH_ARRAY_MAX_CONCURRENT:-1}"
+SBATCH_GPU_BIND="${SBATCH_GPU_BIND:-}"
 
 ONLY=""
 LIMIT=0
 SYSTEM_FILTER="both"
+REPLICATES_OVERRIDE=""
 SUBMIT_DRY_RUN=0
 MPS_STARTED=0
 
@@ -38,6 +40,9 @@ starts a private MPS daemon inside the Slurm allocation, then runs:
 Options:
   --only VALUE       Submit one FEP edge by name, e.g. FEP_1h1q_1oiu, or one system path.
   --system VALUE     For FEP names, submit protein, water, or both. Default: both.
+  --replicates N     Number of concurrent replicas inside each array task. Default: runner default.
+  --array-max-concurrent N
+                     Max concurrent Slurm array tasks. Default: 1.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
   -h, --help        Show this help.
@@ -54,9 +59,11 @@ Environment:
   SBATCH_ACCOUNT=...                  Optional Slurm account.
   SBATCH_QOS=...                      Optional Slurm QoS.
   SBATCH_CONSTRAINT=...               Optional Slurm constraint.
-  SBATCH_ARRAY_MAX_CONCURRENT=N       Optional Slurm array throttle, e.g. 4.
+  SBATCH_ARRAY_MAX_CONCURRENT=1       Slurm array throttle. Raise to the number of GPUs to use.
+  SBATCH_GPU_BIND=single:1            Optional Slurm --gpu-bind value.
   QGPU_METRICS_BASE=./metrics/slurm   Base directory for per-task metrics.
   MPS_ACTIVE_THREAD_PERCENTAGE=10     Optional per-client MPS SM percentage cap.
+  QGPU_ALLOW_UNBOUND_GPU=1            Allow fallback to GPU 0 when Slurm exposes no GPU binding.
 
 Runner environment such as QDYN, QFEP, CLEAN_AFTER, KEEP_QFEP_ONLY,
 CONTINUE_ON_ERROR, and METRIC_INTERVAL is passed through to the local runner.
@@ -84,6 +91,18 @@ parse_args() {
                 [[ $# -ge 2 ]] || die "--system requires protein, water, or both"
                 SYSTEM_FILTER="$2"
                 [[ "$SYSTEM_FILTER" == "protein" || "$SYSTEM_FILTER" == "water" || "$SYSTEM_FILTER" == "both" ]] || die "--system must be protein, water, or both"
+                shift 2
+                ;;
+            --replicates)
+                [[ $# -ge 2 ]] || die "--replicates requires a value"
+                REPLICATES_OVERRIDE="$2"
+                [[ "$REPLICATES_OVERRIDE" =~ ^[1-9][0-9]*$ ]] || die "--replicates must be a positive integer"
+                shift 2
+                ;;
+            --array-max-concurrent)
+                [[ $# -ge 2 ]] || die "--array-max-concurrent requires a value"
+                SBATCH_ARRAY_MAX_CONCURRENT="$2"
+                [[ "$SBATCH_ARRAY_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]] || die "--array-max-concurrent must be a positive integer"
                 shift 2
                 ;;
             --limit)
@@ -197,7 +216,7 @@ submit_array() {
 
     array_spec="1-${#targets[@]}"
     if [[ -n "$SBATCH_ARRAY_MAX_CONCURRENT" ]]; then
-        [[ "$SBATCH_ARRAY_MAX_CONCURRENT" =~ ^[0-9]+$ ]] || die "SBATCH_ARRAY_MAX_CONCURRENT must be an integer"
+        [[ "$SBATCH_ARRAY_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]] || die "SBATCH_ARRAY_MAX_CONCURRENT must be a positive integer"
         array_spec="$array_spec%$SBATCH_ARRAY_MAX_CONCURRENT"
     fi
 
@@ -218,6 +237,7 @@ submit_array() {
     [[ -n "$SBATCH_ACCOUNT" ]] && sbatch_args+=("--account=$SBATCH_ACCOUNT")
     [[ -n "$SBATCH_QOS" ]] && sbatch_args+=("--qos=$SBATCH_QOS")
     [[ -n "$SBATCH_CONSTRAINT" ]] && sbatch_args+=("--constraint=$SBATCH_CONSTRAINT")
+    [[ -n "$SBATCH_GPU_BIND" ]] && sbatch_args+=("--gpu-bind=$SBATCH_GPU_BIND")
 
     if [[ -n "$SBATCH_GRES" ]]; then
         sbatch_args+=("--gres=$SBATCH_GRES")
@@ -267,8 +287,28 @@ start_mps() {
     sleep 1
 }
 
+ensure_single_visible_gpu() {
+    local slurm_gpu_list
+
+    if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        slurm_gpu_list="${SLURM_STEP_GPUS:-${SLURM_JOB_GPUS:-}}"
+        if [[ -n "$slurm_gpu_list" ]]; then
+            export CUDA_VISIBLE_DEVICES="${slurm_gpu_list%%,*}"
+            log "CUDA_VISIBLE_DEVICES was unset; using Slurm GPU allocation: $CUDA_VISIBLE_DEVICES"
+        elif [[ "${QGPU_ALLOW_UNBOUND_GPU:-0}" == "1" ]]; then
+            export CUDA_VISIBLE_DEVICES="${GPU_ID:-0}"
+            log "WARNING: CUDA_VISIBLE_DEVICES is unset; QGPU_ALLOW_UNBOUND_GPU=1, using GPU $CUDA_VISIBLE_DEVICES"
+        else
+            die "CUDA_VISIBLE_DEVICES is unset and Slurm did not provide SLURM_STEP_GPUS/SLURM_JOB_GPUS; refusing to default all array tasks to GPU 0. Check the GPU sbatch option or set QGPU_ALLOW_UNBOUND_GPU=1 for a controlled single-GPU test."
+        fi
+    fi
+
+    [[ "$CUDA_VISIBLE_DEVICES" != *,* ]] || die "Expected exactly one visible GPU per array task, got CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+}
+
 run_array_task() {
     local target tag array_job_id metrics_base rc
+    local runner_args=()
 
     [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]] || die "SLURM_ARRAY_TASK_ID is required; submit this script as an array job"
     [[ -n "${QGPU_TARGET_LIST:-}" ]] || die "QGPU_TARGET_LIST is required"
@@ -287,18 +327,28 @@ run_array_task() {
 
     log "SLURM_JOB_ID=$SLURM_JOB_ID"
     log "SLURM_ARRAY_TASK_ID=$SLURM_ARRAY_TASK_ID"
+    log "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST:-unset}"
+    log "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset}"
+    log "SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-unset}"
+    log "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-unset}"
     log "Target=$target"
-    log "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
     log "METRICS_DIR=$METRICS_DIR"
 
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
+    ensure_single_visible_gpu
+    log "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     start_mps
 
+    runner_args=(--only "$target" --system "$SYSTEM_FILTER")
+    if [[ -n "$REPLICATES_OVERRIDE" ]]; then
+        runner_args+=(--replicates "$REPLICATES_OVERRIDE")
+    fi
+
     set +e
-    "$RUNNER" --only "$target" --system "$SYSTEM_FILTER"
+    "$RUNNER" "${runner_args[@]}"
     rc=$?
     set -e
 
