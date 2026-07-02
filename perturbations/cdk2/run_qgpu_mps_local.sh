@@ -191,9 +191,10 @@ prepend_ld_library_path() {
 }
 
 configure_libstdcxx_runtime() {
-    local qdyn_dir qdyn_root
+    local qdyn_dir qdyn_root script_user_root qdyn_user_root
     local candidates=()
-    local dir resolved resolved_path
+    local dir resolved resolved_path root
+    local roots=()
 
     command -v strings >/dev/null || die "strings is required to check libstdc++ runtime compatibility"
     command -v ldd >/dev/null || die "ldd is required to check qdyn runtime libraries"
@@ -216,16 +217,25 @@ configure_libstdcxx_runtime() {
         if [[ -n "$qdyn_dir" ]]; then
             qdyn_root="$(cd "$qdyn_dir/.." 2>/dev/null && pwd || true)"
             [[ -n "$qdyn_root" ]] && candidates+=("$qdyn_root/lib")
+            qdyn_user_root="$(cd "$qdyn_dir/../../.." 2>/dev/null && pwd || true)"
+            [[ -n "$qdyn_user_root" ]] && roots+=("$qdyn_user_root")
         fi
+        script_user_root="$(cd "$SCRIPT_DIR/../../../.." 2>/dev/null && pwd || true)"
+        [[ -n "$script_user_root" ]] && roots+=("$script_user_root")
+        [[ -n "${HOME:-}" ]] && roots+=("$HOME")
+
         [[ -n "${CONDA_PREFIX:-}" ]] && candidates+=("$CONDA_PREFIX/lib")
         [[ -n "${MAMBA_ROOT_PREFIX:-}" ]] && candidates+=("$MAMBA_ROOT_PREFIX/envs/qligfep_new/lib" "$MAMBA_ROOT_PREFIX/lib")
-        candidates+=(
-            "$HOME/micromamba/envs/qligfep_new/lib"
-            "$HOME/micromamba/envs/qligfepv2/lib"
-            "$HOME/anaconda3/envs/qligfep_new/lib"
-            "$HOME/anaconda3/envs/qligfepv2/lib"
-            "$HOME/anaconda3/lib"
-        )
+        for root in "${roots[@]}"; do
+            candidates+=(
+                "$root/micromamba/envs/qligfep_new/lib"
+                "$root/micromamba/envs/qligfepv2/lib"
+                "$root/micromamba/lib"
+                "$root/anaconda3/envs/qligfep_new/lib"
+                "$root/anaconda3/envs/qligfepv2/lib"
+                "$root/anaconda3/lib"
+            )
+        done
 
         for dir in "${candidates[@]}"; do
             if libstdcxx_has_required_symbol "$dir"; then
