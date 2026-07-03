@@ -8,7 +8,6 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUNNER="${QGPU_SCRIPT_DIR:-$SCRIPT_DIR}/run_qgpu_mps_local.sh"
 
 JOB_NAME="${JOB_NAME:-cdk2-qgpu}"
-LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 SBATCH_TIME="${SBATCH_TIME:-12:00:00}"
 SBATCH_CPUS_PER_TASK="${SBATCH_CPUS_PER_TASK:-8}"
 SBATCH_MEM="${SBATCH_MEM:-48G}"
@@ -19,6 +18,12 @@ SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-}"
 SBATCH_QOS="${SBATCH_QOS:-}"
 SBATCH_CONSTRAINT="${SBATCH_CONSTRAINT:-}"
 SBATCH_GPU_BIND="${SBATCH_GPU_BIND:-}"
+QGPU_USER="${USER:-${LOGNAME:-user}}"
+QGPU_SCRATCH_BASE="${QGPU_SCRATCH_BASE:-/scratch/$QGPU_USER/qgpu_mps/cdk2}"
+QGPU_OUTPUT_BASE="${QGPU_OUTPUT_BASE:-$QGPU_SCRATCH_BASE/jobs}"
+QGPU_METRICS_BASE="${QGPU_METRICS_BASE:-$QGPU_SCRATCH_BASE/metrics}"
+QGPU_COPY_METRICS="${QGPU_COPY_METRICS:-1}"
+LOG_DIR="${LOG_DIR:-$QGPU_SCRATCH_BASE/logs}"
 
 ONLY=""
 LIMIT=0
@@ -27,14 +32,20 @@ REPLICATES_OVERRIDE=""
 IGNORED_ARRAY_MAX_CONCURRENT=""
 SUBMIT_DRY_RUN=0
 MPS_STARTED=0
+STAGE_ROOT=""
+RESULT_DIR=""
+SHARED_METRICS_DIR=""
+RUN_TARGET=""
+STAGED_TARGET=""
+RESULT_SAVED=0
 
 usage() {
     cat <<'EOF'
 Usage:
   ./run_qgpu_mps_slurm.sh [options]
 
-Submits one Slurm job per FEP edge. Each job requests one GPU,
-starts a private MPS daemon inside the Slurm allocation, then runs:
+Submits one Slurm job per FEP edge. Each job requests one GPU, stages the
+selected inputfiles into $TMPDIR, starts a private MPS daemon, then runs:
   ./run_qgpu_mps_local.sh --only EDGE --system VALUE
 
 Options:
@@ -47,7 +58,14 @@ Options:
 
 Environment:
   JOB_NAME=cdk2-qgpu                  Slurm job name.
-  LOG_DIR=./logs                      Directory for Slurm stdout logs and edge list.
+  QGPU_SCRATCH_BASE=/scratch/$USER/qgpu_mps/cdk2
+                                      Shared base for Slurm logs, result archives, and metrics.
+  QGPU_OUTPUT_BASE=$QGPU_SCRATCH_BASE/jobs
+                                      Shared directory for per-job result archives.
+  QGPU_METRICS_BASE=$QGPU_SCRATCH_BASE/metrics
+                                      Shared directory for per-job metric copies.
+  QGPU_COPY_METRICS=1                 Copy local $TMPDIR metrics to QGPU_METRICS_BASE after the run.
+  LOG_DIR=$QGPU_SCRATCH_BASE/logs     Directory for Slurm stdout logs.
   SBATCH_TIME=12:00:00                Slurm wall time.
   SBATCH_CPUS_PER_TASK=8              CPUs allocated to each edge task.
   SBATCH_MEM=48G                      Memory allocated to each edge task.
@@ -58,7 +76,6 @@ Environment:
   SBATCH_QOS=...                      Optional Slurm QoS.
   SBATCH_CONSTRAINT=...               Optional Slurm constraint.
   SBATCH_GPU_BIND=single:1            Optional Slurm --gpu-bind value.
-  QGPU_METRICS_BASE=./metrics/slurm   Base directory for per-task metrics.
   MPS_ACTIVE_THREAD_PERCENTAGE=10     Optional per-client MPS SM percentage cap.
   QGPU_ALLOW_UNBOUND_GPU=1            Allow fallback to GPU 0 when Slurm exposes no GPU binding.
 
@@ -121,10 +138,32 @@ parse_args() {
                 ;;
         esac
     done
+    [[ "$QGPU_COPY_METRICS" == "0" || "$QGPU_COPY_METRICS" == "1" ]] || die "QGPU_COPY_METRICS must be 0 or 1"
 }
 
 safe_tag() {
     printf '%s' "$1" | sed 's#[^A-Za-z0-9_.-]#_#g'
+}
+
+system_dirs_for_filter() {
+    case "$SYSTEM_FILTER" in
+        protein) printf '%s\n' 2.protein ;;
+        water) printf '%s\n' 1.water ;;
+        both) printf '%s\n' 2.protein 1.water ;;
+        *) die "--system must be protein, water, or both" ;;
+    esac
+}
+
+target_tag() {
+    local target="$1"
+    local parent
+
+    if [[ "$target" == FEP_* ]]; then
+        safe_tag "$target.$SYSTEM_FILTER"
+    else
+        parent="$(basename "$(dirname "$target")")"
+        safe_tag "$parent.$(basename "$target")"
+    fi
 }
 
 resolve_one_target() {
@@ -144,12 +183,7 @@ validate_target() {
     local system_dir
     local system_dirs=()
 
-    case "$SYSTEM_FILTER" in
-        protein) system_dirs=(2.protein) ;;
-        water) system_dirs=(1.water) ;;
-        both) system_dirs=(2.protein 1.water) ;;
-        *) die "--system must be protein, water, or both" ;;
-    esac
+    mapfile -t system_dirs < <(system_dirs_for_filter)
 
     if [[ "$target" == FEP_* ]]; then
         for system_dir in "${system_dirs[@]}"; do
@@ -193,7 +227,7 @@ print_command() {
 build_sbatch_args() {
     local target="$1"
     local tag
-    tag="$(safe_tag "$target")"
+    tag="$(target_tag "$target")"
 
     printf '%s\0' \
         "--job-name=$JOB_NAME" \
@@ -263,9 +297,114 @@ submit_jobs() {
     done
 }
 
+require_job_tmpdir() {
+    [[ -n "${TMPDIR:-}" ]] || die "TMPDIR is not set; this runner must stage jobs onto node-local Slurm storage"
+    [[ -d "$TMPDIR" ]] || die "TMPDIR does not exist: $TMPDIR"
+    [[ -w "$TMPDIR" ]] || die "TMPDIR is not writable: $TMPDIR"
+    command -v tar >/dev/null || die "tar is required"
+}
+
+stage_system_path() {
+    local src="$1"
+    local stage_root="$2"
+    local fep_name system_dir dst
+
+    src="$(cd "$src" && pwd)"
+    fep_name="$(basename "$src")"
+    system_dir="$(basename "$(dirname "$src")")"
+    [[ "$system_dir" == "2.protein" || "$system_dir" == "1.water" ]] || die "Cannot infer system from path: $src"
+    [[ -d "$src/inputfiles" ]] || die "Missing inputfiles directory for target path: $src"
+
+    dst="$stage_root/$system_dir/$fep_name"
+    mkdir -p "$dst"
+    cp -a "$src/inputfiles" "$dst/"
+    printf '%s\n' "$dst"
+}
+
+stage_target() {
+    local target="$1"
+    local stage_root="$2"
+    local system_dir
+
+    mkdir -p "$stage_root"
+    cp -p "$RUNNER" "$stage_root/"
+    chmod +x "$stage_root/$(basename "$RUNNER")"
+
+    if [[ "$target" == FEP_* ]]; then
+        while IFS= read -r system_dir; do
+            stage_system_path "$SCRIPT_DIR/$system_dir/$target" "$stage_root" >/dev/null
+        done < <(system_dirs_for_filter)
+        printf '%s\n' "$target"
+    else
+        stage_system_path "$target" "$stage_root"
+    fi
+}
+
+write_run_info() {
+    local rc="$1"
+
+    {
+        printf 'key\tvalue\n'
+        printf 'slurm_job_id\t%s\n' "${SLURM_JOB_ID:-unset}"
+        printf 'slurm_job_nodelist\t%s\n' "${SLURM_JOB_NODELIST:-unset}"
+        printf 'target\t%s\n' "$RUN_TARGET"
+        printf 'staged_target\t%s\n' "$STAGED_TARGET"
+        printf 'system_filter\t%s\n' "$SYSTEM_FILTER"
+        printf 'replicates_override\t%s\n' "${REPLICATES_OVERRIDE:-runner_default}"
+        printf 'script_dir\t%s\n' "$SCRIPT_DIR"
+        printf 'stage_root\t%s\n' "$STAGE_ROOT"
+        printf 'metrics_dir\t%s\n' "$STAGE_ROOT/metrics"
+        printf 'result_dir\t%s\n' "$RESULT_DIR"
+        printf 'shared_metrics_dir\t%s\n' "${SHARED_METRICS_DIR:-disabled}"
+        printf 'exit_code\t%s\n' "$rc"
+    } > "$RESULT_DIR/run_info.tsv"
+}
+
+copy_metrics_to_shared() {
+    [[ "$QGPU_COPY_METRICS" == "1" ]] || return 0
+    [[ -d "$STAGE_ROOT/metrics" ]] || return 0
+
+    mkdir -p "$SHARED_METRICS_DIR"
+    cp -a "$STAGE_ROOT/metrics/." "$SHARED_METRICS_DIR/"
+}
+
+save_results() {
+    local rc="$1"
+    local archive_path archive_tmp
+
+    [[ "$RESULT_SAVED" == "0" ]] || return 0
+    [[ -n "$STAGE_ROOT" && -d "$STAGE_ROOT" && -n "$RESULT_DIR" ]] || return 0
+
+    mkdir -p "$RESULT_DIR"
+    printf '%s\n' "$rc" > "$RESULT_DIR/exit_code.txt"
+    write_run_info "$rc"
+
+    if [[ -f "$STAGE_ROOT/metrics/cdk2_qgpu_mps_summary.tsv" ]]; then
+        cp -p "$STAGE_ROOT/metrics/cdk2_qgpu_mps_summary.tsv" "$RESULT_DIR/summary.tsv"
+    fi
+    if [[ -f "$STAGE_ROOT/metrics/current_status.tsv" ]]; then
+        cp -p "$STAGE_ROOT/metrics/current_status.tsv" "$RESULT_DIR/current_status.tsv"
+    fi
+    copy_metrics_to_shared
+
+    archive_path="$RESULT_DIR/staged_run.tar.gz"
+    archive_tmp="$archive_path.tmp.$$"
+    tar -czf "$archive_tmp" -C "$STAGE_ROOT" .
+    mv "$archive_tmp" "$archive_path"
+
+    RESULT_SAVED=1
+    log "Saved staged results to $archive_path"
+}
+
 cleanup() {
     local rc=$?
     trap - EXIT INT TERM
+
+    if [[ -n "$STAGE_ROOT" && -d "$STAGE_ROOT" && -n "$RESULT_DIR" && "$RESULT_SAVED" == "0" ]]; then
+        if ! save_results "$rc"; then
+            log "WARNING: failed to save staged results from $STAGE_ROOT to $RESULT_DIR"
+        fi
+    fi
 
     if ((MPS_STARTED)); then
         echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
@@ -314,7 +453,7 @@ ensure_single_visible_gpu() {
 }
 
 run_job_task() {
-    local target tag metrics_base rc
+    local target tag rc staged_runner
     local runner_args=()
 
     [[ -n "$ONLY" ]] || die "This Slurm job must be submitted with --only TARGET"
@@ -322,10 +461,16 @@ run_job_task() {
 
     target="$(resolve_one_target)"
     validate_target "$target"
+    require_job_tmpdir
 
-    tag="$(safe_tag "$target")"
-    metrics_base="${QGPU_METRICS_BASE:-$SCRIPT_DIR/metrics/slurm}"
-    export METRICS_DIR="$metrics_base/${SLURM_JOB_ID}_${tag}"
+    RUN_TARGET="$target"
+    tag="$(target_tag "$target")"
+    STAGE_ROOT="$(mktemp -d "$TMPDIR/qgpu_${SLURM_JOB_ID}_${tag}.XXXXXX")"
+    RESULT_DIR="$QGPU_OUTPUT_BASE/${SLURM_JOB_ID}_${tag}"
+    SHARED_METRICS_DIR="$QGPU_METRICS_BASE/${SLURM_JOB_ID}_${tag}"
+    STAGED_TARGET="$(stage_target "$target" "$STAGE_ROOT")"
+    staged_runner="$STAGE_ROOT/$(basename "$RUNNER")"
+    export METRICS_DIR="$STAGE_ROOT/metrics"
     mkdir -p "$METRICS_DIR"
 
     log "SLURM_JOB_ID=$SLURM_JOB_ID"
@@ -335,6 +480,9 @@ run_job_task() {
     log "SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-unset}"
     log "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-unset}"
     log "Target=$target"
+    log "Stage root=$STAGE_ROOT"
+    log "Staged target=$STAGED_TARGET"
+    log "Result dir=$RESULT_DIR"
     log "METRICS_DIR=$METRICS_DIR"
 
     trap cleanup EXIT
@@ -345,15 +493,22 @@ run_job_task() {
     log "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     start_mps
 
-    runner_args=(--only "$target" --system "$SYSTEM_FILTER")
+    runner_args=(--only "$STAGED_TARGET" --system "$SYSTEM_FILTER")
     if [[ -n "$REPLICATES_OVERRIDE" ]]; then
         runner_args+=(--replicates "$REPLICATES_OVERRIDE")
     fi
 
     set +e
-    "$RUNNER" "${runner_args[@]}"
+    "$staged_runner" "${runner_args[@]}"
     rc=$?
     set -e
+
+    if ! save_results "$rc"; then
+        log "WARNING: failed to save staged results from $STAGE_ROOT to $RESULT_DIR"
+        if [[ "$rc" -eq 0 ]]; then
+            rc=1
+        fi
+    fi
 
     log "Finished target=$target exit_code=$rc"
     exit "$rc"
