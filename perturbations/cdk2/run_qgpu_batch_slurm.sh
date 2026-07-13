@@ -31,26 +31,29 @@ SYSTEM_FILTER="both"
 REPLICATES_OVERRIDE=""
 IGNORED_ARRAY_MAX_CONCURRENT=""
 SUBMIT_DRY_RUN=0
+MPS_STARTED=0
 STAGE_ROOT=""
 RESULT_DIR=""
 SHARED_METRICS_DIR=""
 RUN_TARGET=""
 STAGED_TARGET=""
 RESULT_SAVED=0
+ACTIVE_RUNNERS=()
 
 usage() {
     cat <<'EOF'
 Usage:
   ./run_qgpu_batch_slurm.sh [options]
 
-Submits one Slurm job per FEP edge. Each job requests one GPU, stages the
-selected inputfiles into $TMPDIR, then runs one qdyn process per simulation
-stage with all replicas batched into that process:
+Submits one Slurm job per FEP edge. Each job requests one GPU and stages the
+selected inputfiles into $TMPDIR. With --system both (the default), it starts
+CUDA MPS and runs protein and water concurrently as two processes; each process
+batches all of its replicas into one qdyn launch per simulation stage:
   ./run_qgpu_batch_local.sh --only EDGE --system VALUE
 
 Options:
   --only VALUE       Submit one FEP edge by name, e.g. FEP_1h1q_1oiu, or one system path.
-  --system VALUE     For FEP names, submit protein, water, or both. Default: both.
+  --system VALUE     Run protein, water, or both. "both" runs two concurrent MPS clients. Default: both.
   --replicates N     Number of replicas batched into each qdyn process. Default: runner default.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
@@ -76,6 +79,7 @@ Environment:
   SBATCH_QOS=...                      Optional Slurm QoS.
   SBATCH_CONSTRAINT=...               Optional Slurm constraint.
   SBATCH_GPU_BIND=single:1            Optional Slurm --gpu-bind value.
+  MPS_ACTIVE_THREAD_PERCENTAGE=50     Optional SM percentage cap for each of the two MPS clients.
   QGPU_ALLOW_UNBOUND_GPU=1            Allow fallback to GPU 0 when Slurm exposes no GPU binding.
 
 Runner environment such as QDYN, QFEP, CLEAN_AFTER, KEEP_QFEP_ONLY,
@@ -370,6 +374,7 @@ copy_metrics_to_shared() {
 save_results() {
     local rc="$1"
     local archive_path archive_tmp
+    local system
 
     [[ "$RESULT_SAVED" == "0" ]] || return 0
     [[ -n "$STAGE_ROOT" && -d "$STAGE_ROOT" && -n "$RESULT_DIR" ]] || return 0
@@ -378,12 +383,14 @@ save_results() {
     printf '%s\n' "$rc" > "$RESULT_DIR/exit_code.txt"
     write_run_info "$rc"
 
-    if [[ -f "$STAGE_ROOT/metrics/cdk2_qgpu_batch_summary.tsv" ]]; then
-        cp -p "$STAGE_ROOT/metrics/cdk2_qgpu_batch_summary.tsv" "$RESULT_DIR/summary.tsv"
-    fi
-    if [[ -f "$STAGE_ROOT/metrics/current_batch_status.tsv" ]]; then
-        cp -p "$STAGE_ROOT/metrics/current_batch_status.tsv" "$RESULT_DIR/current_status.tsv"
-    fi
+    for system in protein water; do
+        if [[ -f "$STAGE_ROOT/metrics/$system/cdk2_qgpu_batch_summary.tsv" ]]; then
+            cp -p "$STAGE_ROOT/metrics/$system/cdk2_qgpu_batch_summary.tsv" "$RESULT_DIR/summary.$system.tsv"
+        fi
+        if [[ -f "$STAGE_ROOT/metrics/$system/current_batch_status.tsv" ]]; then
+            cp -p "$STAGE_ROOT/metrics/$system/current_batch_status.tsv" "$RESULT_DIR/current_status.$system.tsv"
+        fi
+    done
     copy_metrics_to_shared
 
     archive_path="$RESULT_DIR/staged_run.tar.gz"
@@ -399,13 +406,42 @@ cleanup() {
     local rc=$?
     trap - EXIT INT TERM
 
+    if ((${#ACTIVE_RUNNERS[@]})); then
+        kill "${ACTIVE_RUNNERS[@]}" 2>/dev/null || true
+        wait "${ACTIVE_RUNNERS[@]}" 2>/dev/null || true
+        ACTIVE_RUNNERS=()
+    fi
+
     if [[ -n "$STAGE_ROOT" && -d "$STAGE_ROOT" && -n "$RESULT_DIR" && "$RESULT_SAVED" == "0" ]]; then
         if ! save_results "$rc"; then
             log "WARNING: failed to save staged results from $STAGE_ROOT to $RESULT_DIR"
         fi
     fi
 
+    if ((MPS_STARTED)); then
+        echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
+        MPS_STARTED=0
+    fi
+
     exit "$rc"
+}
+
+start_mps() {
+    command -v nvidia-cuda-mps-control >/dev/null || die "nvidia-cuda-mps-control is required for --system both"
+
+    export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps-${USER:-user}-${SLURM_JOB_ID}}"
+    export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log-${USER:-user}-${SLURM_JOB_ID}}"
+    mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+
+    if [[ -n "${MPS_ACTIVE_THREAD_PERCENTAGE:-}" ]]; then
+        export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="$MPS_ACTIVE_THREAD_PERCENTAGE"
+        log "MPS active thread percentage per client: $CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
+    fi
+
+    log "Starting MPS for concurrent protein/water processes on CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    nvidia-cuda-mps-control -d
+    MPS_STARTED=1
+    sleep 1
 }
 
 ensure_single_visible_gpu() {
@@ -427,9 +463,24 @@ ensure_single_visible_gpu() {
     [[ "$CUDA_VISIBLE_DEVICES" != *,* ]] || die "Expected exactly one visible GPU per job, got CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 }
 
+run_staged_system() {
+    local staged_runner="$1"
+    local system="$2"
+    local system_metrics="$STAGE_ROOT/metrics/$system"
+    local args=(--only "$STAGED_TARGET" --system "$system")
+
+    if [[ -n "$REPLICATES_OVERRIDE" ]]; then
+        args+=(--replicates "$REPLICATES_OVERRIDE")
+    fi
+
+    mkdir -p "$system_metrics"
+    log "Starting $system runner: METRICS_DIR=$system_metrics"
+    METRICS_DIR="$system_metrics" "$staged_runner" "${args[@]}"
+}
+
 run_job_task() {
-    local target tag rc staged_runner
-    local runner_args=()
+    local target tag rc=0 staged_runner system child_rc child_pid idx
+    local systems=()
 
     [[ -n "$ONLY" ]] || die "This Slurm job must be submitted with --only TARGET"
     [[ -x "$RUNNER" ]] || die "Runner is not executable: $RUNNER"
@@ -445,8 +496,7 @@ run_job_task() {
     SHARED_METRICS_DIR="$QGPU_METRICS_BASE/${SLURM_JOB_ID}_${tag}"
     STAGED_TARGET="$(stage_target "$target" "$STAGE_ROOT")"
     staged_runner="$STAGE_ROOT/$(basename "$RUNNER")"
-    export METRICS_DIR="$STAGE_ROOT/metrics"
-    mkdir -p "$METRICS_DIR"
+    mkdir -p "$STAGE_ROOT/metrics"
 
     log "SLURM_JOB_ID=$SLURM_JOB_ID"
     log "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-unset}"
@@ -458,7 +508,7 @@ run_job_task() {
     log "Stage root=$STAGE_ROOT"
     log "Staged target=$STAGED_TARGET"
     log "Result dir=$RESULT_DIR"
-    log "METRICS_DIR=$METRICS_DIR"
+    log "Metrics root=$STAGE_ROOT/metrics"
 
     trap cleanup EXIT
     trap 'exit 130' INT
@@ -467,15 +517,41 @@ run_job_task() {
     ensure_single_visible_gpu
     log "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
-    runner_args=(--only "$STAGED_TARGET" --system "$SYSTEM_FILTER")
-    if [[ -n "$REPLICATES_OVERRIDE" ]]; then
-        runner_args+=(--replicates "$REPLICATES_OVERRIDE")
-    fi
+    case "$SYSTEM_FILTER" in
+        protein) systems=(protein) ;;
+        water) systems=(water) ;;
+        both)
+            [[ "$STAGED_TARGET" == FEP_* ]] || die "Concurrent protein/water mode requires --only to be an FEP name, not a single-system path"
+            systems=(protein water)
+            start_mps
+            ;;
+        *) die "Unsupported system filter: $SYSTEM_FILTER" ;;
+    esac
 
-    set +e
-    "$staged_runner" "${runner_args[@]}"
-    rc=$?
-    set -e
+    for system in "${systems[@]}"; do
+        run_staged_system "$staged_runner" "$system" &
+        child_pid="$!"
+        ACTIVE_RUNNERS+=("$child_pid")
+        log "Launched $system runner pid=$child_pid"
+    done
+
+    for idx in "${!ACTIVE_RUNNERS[@]}"; do
+        set +e
+        wait "${ACTIVE_RUNNERS[$idx]}"
+        child_rc=$?
+        set -e
+        log "Finished ${systems[$idx]} runner pid=${ACTIVE_RUNNERS[$idx]} exit_code=$child_rc"
+        if [[ "$child_rc" -ne 0 ]]; then
+            rc=1
+        fi
+    done
+    ACTIVE_RUNNERS=()
+
+    if ((MPS_STARTED)); then
+        echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
+        MPS_STARTED=0
+        log "Stopped MPS after protein/water runners completed"
+    fi
 
     if ! save_results "$rc"; then
         log "WARNING: failed to save staged results from $STAGE_ROOT to $RESULT_DIR"
