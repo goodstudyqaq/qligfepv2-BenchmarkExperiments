@@ -53,7 +53,7 @@ for required in \
     fi
 done
 
-printf '1/4 Analyzing archived QGPU jobs...\n'
+printf '1/4 Analyzing QGPU jobs...\n'
 python3 "$ROOT/analyze_staged_jobs.py" "$NEW_DATA" \
     --mapping "$MAPPING"
 

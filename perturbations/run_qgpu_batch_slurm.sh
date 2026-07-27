@@ -21,8 +21,8 @@ SBATCH_GPU_BIND="${SBATCH_GPU_BIND:-}"
 QGPU_USER="${USER:-${LOGNAME:-user}}"
 QGPU_SCRATCH_BASE="${QGPU_SCRATCH_BASE:-/scratch/$QGPU_USER/qgpu_batch}"
 QGPU_OUTPUT_BASE="${QGPU_OUTPUT_BASE:-$QGPU_SCRATCH_BASE/jobs}"
-QGPU_METRICS_BASE="${QGPU_METRICS_BASE:-$QGPU_SCRATCH_BASE/metrics}"
-QGPU_COPY_METRICS="${QGPU_COPY_METRICS:-1}"
+QGPU_CLEAN_EXTENSIONS="${QGPU_CLEAN_EXTENSIONS-dcd,log}"
+QGPU_CLEAN_ON_FAILURE="${QGPU_CLEAN_ON_FAILURE:-0}"
 LOG_DIR="${LOG_DIR:-$QGPU_SCRATCH_BASE/logs}"
 
 ONLY=""
@@ -31,11 +31,14 @@ DATASET_DIR=""
 LIMIT=0
 SYSTEM_FILTER="both"
 REPLICATES_OVERRIDE=""
+CLEAN_EXTENSIONS_RAW="$QGPU_CLEAN_EXTENSIONS"
+CLEAN_EXTENSIONS=()
+CLEAN_EXTENSIONS_CSV=""
 IGNORED_ARRAY_MAX_CONCURRENT=""
 SUBMIT_DRY_RUN=0
 STAGE_ROOT=""
 RESULT_DIR=""
-SHARED_METRICS_DIR=""
+METRICS_DIR=""
 RUN_TARGET=""
 STAGED_TARGET=""
 RESULT_SAVED=0
@@ -46,10 +49,10 @@ usage() {
 Usage:
   ./run_qgpu_batch_slurm.sh --dataset DATASET [options]
 
-Submits one Slurm job per FEP edge. Each job requests one GPU and stages the
-selected inputfiles into $TMPDIR. Protein and water run sequentially without
-CUDA MPS; each qdyn process batches all replicas for one system and simulation
-stage:
+Submits one Slurm job per FEP edge. Each job requests one GPU, copies the
+selected inputfiles into QGPU_OUTPUT_BASE, then runs directly in that shared
+result directory. Protein and water run sequentially without CUDA MPS; each
+qdyn process batches all replicas for one system and simulation stage:
   ./run_qgpu_batch_local.sh --dataset DATASET --only EDGE --system VALUE
 
 Options:
@@ -57,6 +60,10 @@ Options:
   --only VALUE       Submit one FEP edge by name, e.g. FEP_1h1q_1oiu, or one system path.
   --system VALUE     Run protein, water, or both. "both" runs them sequentially. Default: both.
   --replicates N     Number of replicas batched into each qdyn process. Default: runner default.
+  --clean-extensions LIST
+                     Comma- or space-separated extensions to remove after a
+                     successful run. Default: dcd,log. Example: dcd,log,inp
+  --no-clean         Keep all generated and copied files.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
   -h, --help        Show this help.
@@ -65,12 +72,12 @@ Environment:
   QGPU_DATASET_DIR=cdk2               Alternative to --dataset.
   JOB_NAME=qgpu-batch                 Slurm job name.
   QGPU_SCRATCH_BASE=/scratch/$USER/qgpu_batch
-                                      Shared base for Slurm logs, result archives, and metrics.
+                                      Shared base for Slurm logs and live results.
   QGPU_OUTPUT_BASE=$QGPU_SCRATCH_BASE/jobs
-                                      Shared directory for per-job result archives.
-  QGPU_METRICS_BASE=$QGPU_SCRATCH_BASE/metrics
-                                      Shared directory for per-job metric copies.
-  QGPU_COPY_METRICS=1                 Copy local $TMPDIR metrics to QGPU_METRICS_BASE after the run.
+                                      Shared directory where jobs read inputs and write outputs.
+  QGPU_CLEAN_EXTENSIONS=dcd,log       Extensions removed after a successful run.
+                                      Leading dots are optional; use an empty value to disable.
+  QGPU_CLEAN_ON_FAILURE=0             Also clean selected extensions after a failed run.
   LOG_DIR=$QGPU_SCRATCH_BASE/logs     Directory for Slurm stdout logs.
   SBATCH_TIME=12:00:00                Slurm wall time.
   SBATCH_CPUS_PER_TASK=8              CPUs allocated to each edge task.
@@ -84,8 +91,9 @@ Environment:
   SBATCH_GPU_BIND=single:1            Optional Slurm --gpu-bind value.
   QGPU_ALLOW_UNBOUND_GPU=1            Allow fallback to GPU 0 when Slurm exposes no GPU binding.
 
-Runner environment such as QDYN, QFEP, CLEAN_AFTER, KEEP_QFEP_ONLY,
-CONTINUE_ON_ERROR, and METRIC_INTERVAL is passed through to the local runner.
+Runner environment such as QDYN, QFEP, CONTINUE_ON_ERROR, and METRIC_INTERVAL
+is passed through. This wrapper forces CLEAN_AFTER=0 and performs the selected
+extension cleanup itself.
 EOF
 }
 
@@ -96,6 +104,30 @@ log() {
 die() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
+}
+
+normalize_clean_extensions() {
+    local ext
+    local normalized="${CLEAN_EXTENSIONS_RAW//,/ }"
+    local values=()
+
+    CLEAN_EXTENSIONS=()
+    read -r -a values <<< "$normalized"
+    for ext in "${values[@]}"; do
+        ext="${ext#.}"
+        [[ -n "$ext" ]] || continue
+        [[ "$ext" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || \
+            die "Invalid cleanup extension: $ext"
+        if [[ " ${CLEAN_EXTENSIONS[*]} " != *" $ext "* ]]; then
+            CLEAN_EXTENSIONS+=("$ext")
+        fi
+    done
+
+    if ((${#CLEAN_EXTENSIONS[@]})); then
+        CLEAN_EXTENSIONS_CSV="$(IFS=,; printf '%s' "${CLEAN_EXTENSIONS[*]}")"
+    else
+        CLEAN_EXTENSIONS_CSV=""
+    fi
 }
 
 parse_args() {
@@ -123,6 +155,15 @@ parse_args() {
                 [[ "$REPLICATES_OVERRIDE" =~ ^[1-9][0-9]*$ ]] || die "--replicates must be a positive integer"
                 shift 2
                 ;;
+            --clean-extensions|--clean)
+                [[ $# -ge 2 ]] || die "$1 requires a comma- or space-separated list"
+                CLEAN_EXTENSIONS_RAW="$2"
+                shift 2
+                ;;
+            --no-clean)
+                CLEAN_EXTENSIONS_RAW=""
+                shift
+                ;;
             --array-max-concurrent)
                 [[ $# -ge 2 ]] || die "--array-max-concurrent requires a value"
                 IGNORED_ARRAY_MAX_CONCURRENT="$2"
@@ -148,7 +189,9 @@ parse_args() {
                 ;;
         esac
     done
-    [[ "$QGPU_COPY_METRICS" == "0" || "$QGPU_COPY_METRICS" == "1" ]] || die "QGPU_COPY_METRICS must be 0 or 1"
+    [[ "$QGPU_CLEAN_ON_FAILURE" == "0" || "$QGPU_CLEAN_ON_FAILURE" == "1" ]] || \
+        die "QGPU_CLEAN_ON_FAILURE must be 0 or 1"
+    normalize_clean_extensions
 }
 
 resolve_dataset() {
@@ -295,6 +338,11 @@ build_child_args() {
     if [[ -n "$REPLICATES_OVERRIDE" ]]; then
         printf '%s\0' "--replicates" "$REPLICATES_OVERRIDE"
     fi
+    if [[ -n "$CLEAN_EXTENSIONS_CSV" ]]; then
+        printf '%s\0' "--clean-extensions" "$CLEAN_EXTENSIONS_CSV"
+    else
+        printf '%s\0' "--no-clean"
+    fi
 }
 
 submit_jobs() {
@@ -330,13 +378,6 @@ submit_jobs() {
             sbatch "${sbatch_args[@]}" "${child_args[@]}"
         fi
     done
-}
-
-require_job_tmpdir() {
-    [[ -n "${TMPDIR:-}" ]] || die "TMPDIR is not set; this runner must stage jobs onto node-local Slurm storage"
-    [[ -d "$TMPDIR" ]] || die "TMPDIR does not exist: $TMPDIR"
-    [[ -w "$TMPDIR" ]] || die "TMPDIR is not writable: $TMPDIR"
-    command -v tar >/dev/null || die "tar is required"
 }
 
 stage_system_path() {
@@ -388,26 +429,43 @@ write_run_info() {
         printf 'system_filter\t%s\n' "$SYSTEM_FILTER"
         printf 'replicates_override\t%s\n' "${REPLICATES_OVERRIDE:-runner_default}"
         printf 'script_dir\t%s\n' "$SCRIPT_DIR"
-        printf 'stage_root\t%s\n' "$STAGE_ROOT"
-        printf 'metrics_dir\t%s\n' "$STAGE_ROOT/metrics"
+        printf 'work_dir\t%s\n' "$STAGE_ROOT"
+        printf 'metrics_dir\t%s\n' "$METRICS_DIR"
         printf 'result_dir\t%s\n' "$RESULT_DIR"
-        printf 'shared_metrics_dir\t%s\n' "${SHARED_METRICS_DIR:-disabled}"
+        printf 'clean_extensions\t%s\n' "${CLEAN_EXTENSIONS_CSV:-none}"
+        printf 'clean_on_failure\t%s\n' "$QGPU_CLEAN_ON_FAILURE"
         printf 'exit_code\t%s\n' "$rc"
     } > "$RESULT_DIR/run_info.tsv"
 }
 
-copy_metrics_to_shared() {
-    [[ "$QGPU_COPY_METRICS" == "1" ]] || return 0
-    [[ -d "$STAGE_ROOT/metrics" ]] || return 0
+clean_selected_outputs() {
+    local rc="$1"
+    local ext count
 
-    mkdir -p "$SHARED_METRICS_DIR"
-    cp -a "$STAGE_ROOT/metrics/." "$SHARED_METRICS_DIR/"
+    if [[ "$rc" -ne 0 && "$QGPU_CLEAN_ON_FAILURE" != "1" ]]; then
+        log "Keeping all files because the run failed with exit code $rc"
+        return 0
+    fi
+    if ((${#CLEAN_EXTENSIONS[@]} == 0)); then
+        log "Extension cleanup disabled; keeping all files"
+        return 0
+    fi
+
+    for ext in "${CLEAN_EXTENSIONS[@]}"; do
+        if ! count="$(
+            find "$RESULT_DIR" -type f -name "*.$ext" -printf '.\n' -delete |
+                wc -l
+        )"; then
+            log "WARNING: failed while removing *.$ext files from $RESULT_DIR"
+            return 1
+        fi
+        count="${count//[[:space:]]/}"
+        log "Removed ${count:-0} *.$ext file(s) from $RESULT_DIR"
+    done
 }
 
 save_results() {
     local rc="$1"
-    local archive_path archive_tmp
-    local system
 
     [[ "$RESULT_SAVED" == "0" ]] || return 0
     [[ -n "$STAGE_ROOT" && -d "$STAGE_ROOT" && -n "$RESULT_DIR" ]] || return 0
@@ -416,23 +474,15 @@ save_results() {
     printf '%s\n' "$rc" > "$RESULT_DIR/exit_code.txt"
     write_run_info "$rc"
 
-    for system in protein water; do
-        if [[ -f "$STAGE_ROOT/metrics/$system/qgpu_batch_summary.tsv" ]]; then
-            cp -p "$STAGE_ROOT/metrics/$system/qgpu_batch_summary.tsv" "$RESULT_DIR/summary.$system.tsv"
-        fi
-        if [[ -f "$STAGE_ROOT/metrics/$system/current_batch_status.tsv" ]]; then
-            cp -p "$STAGE_ROOT/metrics/$system/current_batch_status.tsv" "$RESULT_DIR/current_status.$system.tsv"
-        fi
-    done
-    copy_metrics_to_shared
-
-    archive_path="$RESULT_DIR/staged_run.tar.gz"
-    archive_tmp="$archive_path.tmp.$$"
-    tar -czf "$archive_tmp" -C "$STAGE_ROOT" .
-    mv "$archive_tmp" "$archive_path"
+    if [[ -f "$METRICS_DIR/qgpu_batch_summary.tsv" ]]; then
+        cp -p "$METRICS_DIR/qgpu_batch_summary.tsv" "$RESULT_DIR/summary.tsv"
+    fi
+    if [[ -f "$METRICS_DIR/current_batch_status.tsv" ]]; then
+        cp -p "$METRICS_DIR/current_batch_status.tsv" "$RESULT_DIR/current_status.tsv"
+    fi
 
     RESULT_SAVED=1
-    log "Saved staged results to $archive_path"
+    log "Finalized results in $RESULT_DIR"
 }
 
 cleanup() {
@@ -447,7 +497,7 @@ cleanup() {
 
     if [[ -n "$STAGE_ROOT" && -d "$STAGE_ROOT" && -n "$RESULT_DIR" && "$RESULT_SAVED" == "0" ]]; then
         if ! save_results "$rc"; then
-            log "WARNING: failed to save staged results from $STAGE_ROOT to $RESULT_DIR"
+            log "WARNING: failed to finalize results in $RESULT_DIR"
         fi
     fi
 
@@ -476,16 +526,14 @@ ensure_single_visible_gpu() {
 run_staged_system() {
     local staged_runner="$1"
     local system="$2"
-    local system_metrics="$STAGE_ROOT/metrics/$system"
     local args=(--dataset "$STAGE_ROOT" --only "$STAGED_TARGET" --system "$system")
 
     if [[ -n "$REPLICATES_OVERRIDE" ]]; then
         args+=(--replicates "$REPLICATES_OVERRIDE")
     fi
 
-    mkdir -p "$system_metrics"
-    log "Starting $system runner: METRICS_DIR=$system_metrics"
-    METRICS_DIR="$system_metrics" "$staged_runner" "${args[@]}"
+    log "Starting $system runner: METRICS_DIR=$METRICS_DIR"
+    METRICS_DIR="$METRICS_DIR" "$staged_runner" "${args[@]}"
 }
 
 run_job_task() {
@@ -497,16 +545,18 @@ run_job_task() {
 
     target="$(resolve_one_target)"
     validate_target "$target"
-    require_job_tmpdir
 
     RUN_TARGET="$target"
     tag="$(target_tag "$target")"
-    STAGE_ROOT="$(mktemp -d "$TMPDIR/qgpu_${SLURM_JOB_ID}_${tag}.XXXXXX")"
     RESULT_DIR="$QGPU_OUTPUT_BASE/${SLURM_JOB_ID}_${tag}"
-    SHARED_METRICS_DIR="$QGPU_METRICS_BASE/${SLURM_JOB_ID}_${tag}"
+    STAGE_ROOT="$RESULT_DIR/work"
+    METRICS_DIR="$RESULT_DIR/metrics"
+
+    mkdir -p "$RESULT_DIR"
+    [[ ! -e "$STAGE_ROOT" ]] || die "Work directory already exists; refusing to overwrite it: $STAGE_ROOT"
     STAGED_TARGET="$(stage_target "$target" "$STAGE_ROOT")"
     staged_runner="$STAGE_ROOT/$(basename "$RUNNER")"
-    mkdir -p "$STAGE_ROOT/metrics"
+    mkdir -p "$METRICS_DIR"
 
     log "SLURM_JOB_ID=$SLURM_JOB_ID"
     log "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-unset}"
@@ -515,10 +565,11 @@ run_job_task() {
     log "SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-unset}"
     log "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-unset}"
     log "Target=$target"
-    log "Stage root=$STAGE_ROOT"
+    log "Shared work dir=$STAGE_ROOT"
     log "Staged target=$STAGED_TARGET"
     log "Result dir=$RESULT_DIR"
-    log "Metrics root=$STAGE_ROOT/metrics"
+    log "METRICS_DIR=$METRICS_DIR"
+    log "Cleanup extensions=${CLEAN_EXTENSIONS_CSV:-none}"
 
     trap cleanup EXIT
     trap 'exit 130' INT
@@ -526,6 +577,10 @@ run_job_task() {
 
     ensure_single_visible_gpu
     log "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+
+    # Keep all runner output until the wrapper applies the selected extension
+    # policy. This guarantees that .en files are not removed by legacy cleanup.
+    export CLEAN_AFTER=0
 
     case "$SYSTEM_FILTER" in
         protein) systems=(protein) ;;
@@ -558,8 +613,15 @@ run_job_task() {
         fi
     done
 
+    if ! clean_selected_outputs "$rc"; then
+        log "WARNING: failed to clean selected extensions in $RESULT_DIR"
+        if [[ "$rc" -eq 0 ]]; then
+            rc=1
+        fi
+    fi
+
     if ! save_results "$rc"; then
-        log "WARNING: failed to save staged results from $STAGE_ROOT to $RESULT_DIR"
+        log "WARNING: failed to finalize results in $RESULT_DIR"
         if [[ "$rc" -eq 0 ]]; then
             rc=1
         fi

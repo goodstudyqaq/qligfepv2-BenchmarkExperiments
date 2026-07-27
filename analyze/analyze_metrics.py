@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Build a self-contained HTML resource report from downloaded QGPU metrics.
 
-The input directory is expected to contain:
+Current result directories contain:
 
-    metrics/<job>.both/qgpu_mps_summary.tsv
-    metrics/<job>.both/raw/*.cpu_mem.csv
-    metrics/<job>.both/raw/*.gpu.csv
-    metrics/<job>.both/raw/*.runner.log
+    jobs/<job>.both/metrics/qgpu_mps_summary.tsv  (MPS)
+    jobs/<job>.both/metrics/qgpu_batch_summary.tsv  (batch)
+    jobs/<job>.both/metrics/raw/*
+
+The older consolidated ``metrics/<job>.both`` layout is also accepted.
 
 Only the Python standard library is required.
 """
@@ -213,23 +214,57 @@ def load_gpu(run: SystemRun, path: Path | None) -> None:
     run.gpu_power_peak_w = maximum(number(row.get("gpu_power_w")) for row in rows)
 
 
-def load_metrics(data_dir: Path) -> tuple[list[SystemRun], list[StepMetric], list[str]]:
+def find_metric_jobs(data_dir: Path) -> list[Path]:
+    """Locate current job-local metrics or the legacy metrics tree."""
+    jobs_dir = data_dir / "jobs"
+    if jobs_dir.is_dir():
+        jobs = sorted(
+            path / "metrics"
+            for path in jobs_dir.iterdir()
+            if path.is_dir() and (path / "metrics").is_dir()
+        )
+        if jobs:
+            return jobs
+
     metrics_dir = data_dir / "metrics"
-    if not metrics_dir.is_dir():
-        raise SystemExit(f"Metrics directory not found: {metrics_dir}")
+    if metrics_dir.is_dir():
+        jobs = sorted(path for path in metrics_dir.iterdir() if path.is_dir())
+        if jobs:
+            return jobs
+
+    if data_dir.is_dir() and data_dir.name == "jobs":
+        jobs = sorted(
+            path / "metrics"
+            for path in data_dir.iterdir()
+            if path.is_dir() and (path / "metrics").is_dir()
+        )
+        if jobs:
+            return jobs
+
+    raise SystemExit(
+        f"No job metrics found under {data_dir / 'jobs'} or {data_dir / 'metrics'}"
+    )
+
+
+def load_metrics(data_dir: Path) -> tuple[list[SystemRun], list[StepMetric], list[str]]:
+    jobs = find_metric_jobs(data_dir)
 
     runs: list[SystemRun] = []
     steps: list[StepMetric] = []
     warnings: list[str] = []
-    jobs = sorted(path for path in metrics_dir.iterdir() if path.is_dir())
-    if not jobs:
-        raise SystemExit(f"No job directories found under {metrics_dir}")
 
     for job_dir in jobs:
-        summary = job_dir / "qgpu_mps_summary.tsv"
+        job_name = job_dir.parent.name if job_dir.name == "metrics" else job_dir.name
+        summaries = [
+            job_dir / "qgpu_mps_summary.tsv",
+            job_dir / "qgpu_batch_summary.tsv",
+        ]
+        summary = next((path for path in summaries if path.is_file()), summaries[0])
         rows = read_dicts(summary, "\t")
         if not rows:
-            warnings.append(f"{job_dir.name}: missing or empty qgpu_mps_summary.tsv")
+            warnings.append(
+                f"{job_name}: missing or empty qgpu_mps_summary.tsv/qgpu_batch_summary.tsv"
+            )
             continue
         raw_dir = job_dir / "raw"
         for row in rows:
@@ -240,8 +275,8 @@ def load_metrics(data_dir: Path) -> tuple[list[SystemRun], list[StepMetric], lis
             if not math.isfinite(wall) and start and end:
                 wall = (end - start).total_seconds()
             run = SystemRun(
-                job=job_dir.name,
-                fep_id=row.get("fep_id", job_dir.name).strip(),
+                job=job_name,
+                fep_id=row.get("fep_id", job_name).strip(),
                 system=system,
                 status=row.get("status", "unknown").strip(),
                 start=start,
@@ -257,7 +292,7 @@ def load_metrics(data_dir: Path) -> tuple[list[SystemRun], list[StepMetric], lis
             try:
                 text = log_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
-                warnings.append(f"{job_dir.name}: could not read {log_path.name}")
+                warnings.append(f"{job_name}: could not read {log_path.name}")
                 continue
             for match in DONE_RE.finditer(text):
                 steps.append(
@@ -628,10 +663,11 @@ bindFilter("job-filter","jobs"); bindFilter("step-filter","steps");
 def main() -> int:
     args = arguments()
     data_dir = args.data_dir.expanduser().resolve()
-    output = (args.output or data_dir / "metrics_report.html").expanduser().resolve()
+    result_root = data_dir.parent if data_dir.name == "jobs" else data_dir
+    output = (args.output or result_root / "metrics_report.html").expanduser().resolve()
     runs, steps, warnings = load_metrics(data_dir)
     if not runs:
-        raise SystemExit(f"No system metrics could be loaded from {data_dir / 'metrics'}")
+        raise SystemExit(f"No system metrics could be loaded from {data_dir}")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(make_html(data_dir, runs, steps, warnings), encoding="utf-8")
     print(f"Analyzed {len({run.job for run in runs})} jobs / {len(runs)} system runs")

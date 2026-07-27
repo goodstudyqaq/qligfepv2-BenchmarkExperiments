@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Analyze archived QGPU FEP jobs without unpacking the bulky run directories."""
+"""Analyze current or legacy QGPU MPS FEP job results.
+
+Current jobs keep the run tree under ``jobs/<job>/work``.  Older jobs stored
+the same tree in ``jobs/<job>/staged_run.tar.gz``.  Both layouts are accepted.
+"""
 
 from __future__ import annotations
 
@@ -22,9 +26,13 @@ QFEP_PATH = re.compile(
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate staged .both jobs and calculate protein-water BAR ddG values."
+        description="Validate QGPU .both jobs and calculate protein-water BAR ddG values."
     )
-    parser.add_argument("data_dir", type=Path, help="Directory containing jobs/*/staged_run.tar.gz")
+    parser.add_argument(
+        "data_dir",
+        type=Path,
+        help="Directory containing jobs/, or the jobs/ directory itself",
+    )
     parser.add_argument("--output", "-o", type=Path, help="Output directory (default: DATA_DIR/ddg_analysis)")
     parser.add_argument("--mapping", type=Path, default=Path("mapping.json"), help="Mapping JSON with experimental edge ddg_value values")
     parser.add_argument("--compare", type=Path, help="Optional previous ddg_summary.csv")
@@ -93,9 +101,61 @@ def write_csv(path: Path, rows: list[dict[str, object]], fields: list[str]) -> N
         writer.writerows(rows)
 
 
+def resolve_jobs_dir(data_dir: Path) -> Path:
+    """Accept either the downloaded data root or its jobs directory."""
+    data_dir = data_dir.expanduser().resolve()
+    nested = data_dir / "jobs"
+    if nested.is_dir():
+        return nested
+    if data_dir.is_dir() and data_dir.name == "jobs":
+        return data_dir
+    raise SystemExit(
+        f"Jobs directory not found: expected {nested} or a directory named jobs"
+    )
+
+
+def qfep_outputs(job: Path) -> tuple[str, list[tuple[str, str]]]:
+    """Return (layout, [(source, text), ...]) for one job.
+
+    Prefer the current uncompressed work directory when it exists.  Falling
+    back to the legacy archive keeps previously downloaded datasets usable.
+    """
+    work = job / "work"
+    if work.is_dir():
+        outputs = []
+        for path in sorted(work.rglob("qfep.out")):
+            if path.is_file() and QFEP_PATH.search(path.as_posix()):
+                outputs.append(
+                    (
+                        str(path),
+                        path.read_text(encoding="utf-8", errors="replace"),
+                    )
+                )
+        return "work", outputs
+
+    archive = job / "staged_run.tar.gz"
+    if archive.is_file():
+        outputs = []
+        with tarfile.open(archive, "r:gz") as tar:
+            for member in tar:
+                if not member.isfile() or not QFEP_PATH.search(member.name):
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                text = io.TextIOWrapper(
+                    extracted, encoding="utf-8", errors="replace"
+                ).read()
+                outputs.append((f"{archive}:{member.name}", text))
+        return "archive", outputs
+
+    return "missing", []
+
+
 def main() -> int:
     args = arguments()
-    output = args.output or args.data_dir / "ddg_analysis"
+    jobs_dir = resolve_jobs_dir(args.data_dir)
+    output = args.output or jobs_dir.parent / "ddg_analysis"
     output.mkdir(parents=True, exist_ok=True)
     exp_q_convention = experimental_edges(args.mapping)
     old, old_exp = read_old_summary(args.compare)
@@ -107,12 +167,11 @@ def main() -> int:
     replicate_rows: list[dict[str, object]] = []
     job_rows: list[dict[str, object]] = []
 
-    jobs = sorted((args.data_dir / "jobs").glob("*.both"))
+    jobs = sorted(path for path in jobs_dir.glob("*.both") if path.is_dir())
     if not jobs:
-        raise SystemExit(f"No *.both jobs found under {args.data_dir / 'jobs'}")
+        raise SystemExit(f"No *.both job directories found under {jobs_dir}")
 
     for job in jobs:
-        archive = job / "staged_run.tar.gz"
         exit_code = (job / "exit_code.txt").read_text().strip() if (job / "exit_code.txt").is_file() else "missing"
         status_rows = []
         if (job / "summary.tsv").is_file():
@@ -122,21 +181,24 @@ def main() -> int:
 
         legs: dict[str, dict[str, float]] = {"water": {}, "protein": {}}
         edge_ids = set()
-        with tarfile.open(archive, "r:gz") as tar:
-            for member in tar:
-                match = QFEP_PATH.search(member.name)
-                if not match or not member.isfile():
-                    continue
-                system_dir, edge, _temperature, replicate = match.groups()
-                extracted = tar.extractfile(member)
-                if extracted is None:
-                    continue
-                value = parse_bar(io.TextIOWrapper(extracted, encoding="utf-8", errors="replace").read(), f"{archive}:{member.name}")
-                system = "water" if system_dir == "1.water" else "protein"
-                legs[system][replicate] = value
-                edge_ids.add(edge)
+        layout, outputs = qfep_outputs(job)
+        if layout == "missing":
+            raise FileNotFoundError(
+                f"{job}: found neither work/ nor staged_run.tar.gz"
+            )
+        if not outputs:
+            raise ValueError(f"No qfep.out files found in {job / layout}")
+        for source, text in outputs:
+            match = QFEP_PATH.search(source)
+            if match is None:
+                continue
+            system_dir, edge, _temperature, replicate = match.groups()
+            value = parse_bar(text, source)
+            system = "water" if system_dir == "1.water" else "protein"
+            legs[system][replicate] = value
+            edge_ids.add(edge)
         if len(edge_ids) != 1:
-            raise ValueError(f"Expected one FEP edge in {archive}, found {sorted(edge_ids)}")
+            raise ValueError(f"Expected one FEP edge in {job}, found {sorted(edge_ids)}")
         edge = edge_ids.pop()
         reps = sorted(set(legs["water"]) & set(legs["protein"]), key=lambda x: int(x) if x.isdigit() else x)
         if set(legs["water"]) != set(legs["protein"]) or len(reps) != args.expected_replicates:
@@ -147,7 +209,7 @@ def main() -> int:
             replicate_rows.append({"fep_id": edge, "from": left, "to": right, "replicate": rep,
                                    "water_dGbar": f"{water:.6f}", "protein_dGbar": f"{protein:.6f}",
                                    "Q_ddG": f"{protein - water:.6f}", "source_job": job.name})
-        job_rows.append({"fep_id": edge, "job": job.name, "exit_code": exit_code, "status": job_status,
+        job_rows.append({"fep_id": edge, "job": job.name, "layout": layout, "exit_code": exit_code, "status": job_status,
                          "water_replicates": len(legs["water"]), "protein_replicates": len(legs["protein"])})
 
     summary_rows = []
@@ -175,7 +237,7 @@ def main() -> int:
                "exp_ddG_Q_convention", "Q_minus_exp",
                "previous_Q_ddG_avg", "new_minus_previous"])
     write_csv(output / "job_validation.csv", job_rows,
-              ["fep_id", "job", "exit_code", "status", "water_replicates", "protein_replicates"])
+              ["fep_id", "job", "layout", "exit_code", "status", "water_replicates", "protein_replicates"])
     print(f"Analyzed {len(jobs)} jobs / {len(replicate_rows)} paired replicates")
     print(f"Validation: {sum(r['status'] == 'ok' for r in job_rows)} ok, {sum(r['status'] != 'ok' for r in job_rows)} check")
     print(f"Results: {output / 'ddg_summary.csv'}")
