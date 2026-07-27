@@ -4,10 +4,10 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="${QGPU_SCRIPT_DIR:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNNER="${QGPU_SCRIPT_DIR:-$SCRIPT_DIR}/run_qgpu_batch_local.sh"
 
-JOB_NAME="${JOB_NAME:-cdk2-qgpu}"
+JOB_NAME="${JOB_NAME:-qgpu-batch}"
 SBATCH_TIME="${SBATCH_TIME:-12:00:00}"
 SBATCH_CPUS_PER_TASK="${SBATCH_CPUS_PER_TASK:-8}"
 SBATCH_MEM="${SBATCH_MEM:-48G}"
@@ -19,19 +19,20 @@ SBATCH_QOS="${SBATCH_QOS:-}"
 SBATCH_CONSTRAINT="${SBATCH_CONSTRAINT:-}"
 SBATCH_GPU_BIND="${SBATCH_GPU_BIND:-}"
 QGPU_USER="${USER:-${LOGNAME:-user}}"
-QGPU_SCRATCH_BASE="${QGPU_SCRATCH_BASE:-/scratch/$QGPU_USER/qgpu_batch/cdk2}"
+QGPU_SCRATCH_BASE="${QGPU_SCRATCH_BASE:-/scratch/$QGPU_USER/qgpu_batch}"
 QGPU_OUTPUT_BASE="${QGPU_OUTPUT_BASE:-$QGPU_SCRATCH_BASE/jobs}"
 QGPU_METRICS_BASE="${QGPU_METRICS_BASE:-$QGPU_SCRATCH_BASE/metrics}"
 QGPU_COPY_METRICS="${QGPU_COPY_METRICS:-1}"
 LOG_DIR="${LOG_DIR:-$QGPU_SCRATCH_BASE/logs}"
 
 ONLY=""
+DATASET="${QGPU_DATASET_DIR:-}"
+DATASET_DIR=""
 LIMIT=0
 SYSTEM_FILTER="both"
 REPLICATES_OVERRIDE=""
 IGNORED_ARRAY_MAX_CONCURRENT=""
 SUBMIT_DRY_RUN=0
-MPS_STARTED=0
 STAGE_ROOT=""
 RESULT_DIR=""
 SHARED_METRICS_DIR=""
@@ -43,25 +44,27 @@ ACTIVE_RUNNERS=()
 usage() {
     cat <<'EOF'
 Usage:
-  ./run_qgpu_batch_slurm.sh [options]
+  ./run_qgpu_batch_slurm.sh --dataset DATASET [options]
 
 Submits one Slurm job per FEP edge. Each job requests one GPU and stages the
-selected inputfiles into $TMPDIR. With --system both (the default), it starts
-CUDA MPS and runs protein and water concurrently as two processes; each process
-batches all of its replicas into one qdyn launch per simulation stage:
-  ./run_qgpu_batch_local.sh --only EDGE --system VALUE
+selected inputfiles into $TMPDIR. Protein and water run sequentially without
+CUDA MPS; each qdyn process batches all replicas for one system and simulation
+stage:
+  ./run_qgpu_batch_local.sh --dataset DATASET --only EDGE --system VALUE
 
 Options:
+  --dataset VALUE    Dataset name under perturbations (e.g. cdk2 or hif2a), or its path.
   --only VALUE       Submit one FEP edge by name, e.g. FEP_1h1q_1oiu, or one system path.
-  --system VALUE     Run protein, water, or both. "both" runs two concurrent MPS clients. Default: both.
+  --system VALUE     Run protein, water, or both. "both" runs them sequentially. Default: both.
   --replicates N     Number of replicas batched into each qdyn process. Default: runner default.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
   -h, --help        Show this help.
 
 Environment:
-  JOB_NAME=cdk2-qgpu                  Slurm job name.
-  QGPU_SCRATCH_BASE=/scratch/$USER/qgpu_batch/cdk2
+  QGPU_DATASET_DIR=cdk2               Alternative to --dataset.
+  JOB_NAME=qgpu-batch                 Slurm job name.
+  QGPU_SCRATCH_BASE=/scratch/$USER/qgpu_batch
                                       Shared base for Slurm logs, result archives, and metrics.
   QGPU_OUTPUT_BASE=$QGPU_SCRATCH_BASE/jobs
                                       Shared directory for per-job result archives.
@@ -79,7 +82,6 @@ Environment:
   SBATCH_QOS=...                      Optional Slurm QoS.
   SBATCH_CONSTRAINT=...               Optional Slurm constraint.
   SBATCH_GPU_BIND=single:1            Optional Slurm --gpu-bind value.
-  MPS_ACTIVE_THREAD_PERCENTAGE=50     Optional SM percentage cap for each of the two MPS clients.
   QGPU_ALLOW_UNBOUND_GPU=1            Allow fallback to GPU 0 when Slurm exposes no GPU binding.
 
 Runner environment such as QDYN, QFEP, CLEAN_AFTER, KEEP_QFEP_ONLY,
@@ -99,6 +101,11 @@ die() {
 parse_args() {
     while (($#)); do
         case "$1" in
+            --dataset)
+                [[ $# -ge 2 ]] || die "--dataset requires a value"
+                DATASET="$2"
+                shift 2
+                ;;
             --only)
                 [[ $# -ge 2 ]] || die "--only requires a value"
                 ONLY="$2"
@@ -144,6 +151,23 @@ parse_args() {
     [[ "$QGPU_COPY_METRICS" == "0" || "$QGPU_COPY_METRICS" == "1" ]] || die "QGPU_COPY_METRICS must be 0 or 1"
 }
 
+resolve_dataset() {
+    [[ -n "$DATASET" ]] || die "--dataset is required (for example: --dataset cdk2)"
+
+    if [[ -d "$DATASET" ]]; then
+        DATASET_DIR="$(cd "$DATASET" && pwd)"
+    elif [[ -d "$SCRIPT_DIR/$DATASET" ]]; then
+        DATASET_DIR="$(cd "$SCRIPT_DIR/$DATASET" && pwd)"
+    elif [[ -d "$REPO_ROOT/$DATASET" ]]; then
+        DATASET_DIR="$(cd "$REPO_ROOT/$DATASET" && pwd)"
+    else
+        die "Dataset is neither an existing path nor a directory under perturbations: $DATASET"
+    fi
+
+    [[ -d "$DATASET_DIR/2.protein" || -d "$DATASET_DIR/1.water" ]] || \
+        die "Dataset has neither 2.protein nor 1.water: $DATASET_DIR"
+}
+
 safe_tag() {
     printf '%s' "$1" | sed 's#[^A-Za-z0-9_.-]#_#g'
 }
@@ -159,13 +183,14 @@ system_dirs_for_filter() {
 
 target_tag() {
     local target="$1"
-    local parent
+    local dataset_tag parent
+    dataset_tag="$(basename "$DATASET_DIR")"
 
     if [[ "$target" == FEP_* ]]; then
-        safe_tag "$target.$SYSTEM_FILTER"
+        safe_tag "$dataset_tag.$target.$SYSTEM_FILTER"
     else
         parent="$(basename "$(dirname "$target")")"
-        safe_tag "$parent.$(basename "$target")"
+        safe_tag "$dataset_tag.$parent.$(basename "$target")"
     fi
 }
 
@@ -190,7 +215,7 @@ validate_target() {
 
     if [[ "$target" == FEP_* ]]; then
         for system_dir in "${system_dirs[@]}"; do
-            [[ -d "$SCRIPT_DIR/$system_dir/$target/inputfiles" ]] || die "Missing system path: $SCRIPT_DIR/$system_dir/$target"
+            [[ -d "$DATASET_DIR/$system_dir/$target/inputfiles" ]] || die "Missing system path: $DATASET_DIR/$system_dir/$target"
         done
     else
         [[ -d "$target/inputfiles" ]] || die "Missing inputfiles directory for target path: $target"
@@ -205,9 +230,16 @@ resolve_targets() {
         target="$(resolve_one_target)"
         targets+=("$target")
     else
+        local discovery_dir
+        if [[ "$SYSTEM_FILTER" == "water" ]]; then
+            discovery_dir="$DATASET_DIR/1.water"
+        else
+            discovery_dir="$DATASET_DIR/2.protein"
+        fi
+        [[ -d "$discovery_dir" ]] || die "Missing discovery directory: $discovery_dir"
         while IFS= read -r target; do
             targets+=("$target")
-        done < <(find "$SCRIPT_DIR/2.protein" -maxdepth 1 -type d -name 'FEP_*' -printf '%f\n' | sort)
+        done < <(find "$discovery_dir" -maxdepth 1 -type d -name 'FEP_*' -printf '%f\n' | sort)
     fi
 
     if ((LIMIT > 0 && LIMIT < ${#targets[@]})); then
@@ -259,7 +291,7 @@ build_sbatch_args() {
 build_child_args() {
     local target="$1"
 
-    printf '%s\0' "$SCRIPT_PATH" "--only" "$target" "--system" "$SYSTEM_FILTER"
+    printf '%s\0' "$SCRIPT_PATH" "--dataset" "$DATASET_DIR" "--only" "$target" "--system" "$SYSTEM_FILTER"
     if [[ -n "$REPLICATES_OVERRIDE" ]]; then
         printf '%s\0' "--replicates" "$REPLICATES_OVERRIDE"
     fi
@@ -335,7 +367,7 @@ stage_target() {
 
     if [[ "$target" == FEP_* ]]; then
         while IFS= read -r system_dir; do
-            stage_system_path "$SCRIPT_DIR/$system_dir/$target" "$stage_root" >/dev/null
+            stage_system_path "$DATASET_DIR/$system_dir/$target" "$stage_root" >/dev/null
         done < <(system_dirs_for_filter)
         printf '%s\n' "$target"
     else
@@ -351,6 +383,7 @@ write_run_info() {
         printf 'slurm_job_id\t%s\n' "${SLURM_JOB_ID:-unset}"
         printf 'slurm_job_nodelist\t%s\n' "${SLURM_JOB_NODELIST:-unset}"
         printf 'target\t%s\n' "$RUN_TARGET"
+        printf 'dataset_dir\t%s\n' "$DATASET_DIR"
         printf 'staged_target\t%s\n' "$STAGED_TARGET"
         printf 'system_filter\t%s\n' "$SYSTEM_FILTER"
         printf 'replicates_override\t%s\n' "${REPLICATES_OVERRIDE:-runner_default}"
@@ -384,8 +417,8 @@ save_results() {
     write_run_info "$rc"
 
     for system in protein water; do
-        if [[ -f "$STAGE_ROOT/metrics/$system/cdk2_qgpu_batch_summary.tsv" ]]; then
-            cp -p "$STAGE_ROOT/metrics/$system/cdk2_qgpu_batch_summary.tsv" "$RESULT_DIR/summary.$system.tsv"
+        if [[ -f "$STAGE_ROOT/metrics/$system/qgpu_batch_summary.tsv" ]]; then
+            cp -p "$STAGE_ROOT/metrics/$system/qgpu_batch_summary.tsv" "$RESULT_DIR/summary.$system.tsv"
         fi
         if [[ -f "$STAGE_ROOT/metrics/$system/current_batch_status.tsv" ]]; then
             cp -p "$STAGE_ROOT/metrics/$system/current_batch_status.tsv" "$RESULT_DIR/current_status.$system.tsv"
@@ -418,30 +451,7 @@ cleanup() {
         fi
     fi
 
-    if ((MPS_STARTED)); then
-        echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
-        MPS_STARTED=0
-    fi
-
     exit "$rc"
-}
-
-start_mps() {
-    command -v nvidia-cuda-mps-control >/dev/null || die "nvidia-cuda-mps-control is required for --system both"
-
-    export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps-${USER:-user}-${SLURM_JOB_ID}}"
-    export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log-${USER:-user}-${SLURM_JOB_ID}}"
-    mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
-
-    if [[ -n "${MPS_ACTIVE_THREAD_PERCENTAGE:-}" ]]; then
-        export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="$MPS_ACTIVE_THREAD_PERCENTAGE"
-        log "MPS active thread percentage per client: $CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
-    fi
-
-    log "Starting MPS for concurrent protein/water processes on CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-    nvidia-cuda-mps-control -d
-    MPS_STARTED=1
-    sleep 1
 }
 
 ensure_single_visible_gpu() {
@@ -467,7 +477,7 @@ run_staged_system() {
     local staged_runner="$1"
     local system="$2"
     local system_metrics="$STAGE_ROOT/metrics/$system"
-    local args=(--only "$STAGED_TARGET" --system "$system")
+    local args=(--dataset "$STAGE_ROOT" --only "$STAGED_TARGET" --system "$system")
 
     if [[ -n "$REPLICATES_OVERRIDE" ]]; then
         args+=(--replicates "$REPLICATES_OVERRIDE")
@@ -479,7 +489,7 @@ run_staged_system() {
 }
 
 run_job_task() {
-    local target tag rc=0 staged_runner system child_rc child_pid idx
+    local target tag rc=0 staged_runner system child_rc child_pid
     local systems=()
 
     [[ -n "$ONLY" ]] || die "This Slurm job must be submitted with --only TARGET"
@@ -521,9 +531,8 @@ run_job_task() {
         protein) systems=(protein) ;;
         water) systems=(water) ;;
         both)
-            [[ "$STAGED_TARGET" == FEP_* ]] || die "Concurrent protein/water mode requires --only to be an FEP name, not a single-system path"
+            [[ "$STAGED_TARGET" == FEP_* ]] || die "Protein/water mode requires --only to be an FEP name, not a single-system path"
             systems=(protein water)
-            start_mps
             ;;
         *) die "Unsupported system filter: $SYSTEM_FILTER" ;;
     esac
@@ -531,27 +540,23 @@ run_job_task() {
     for system in "${systems[@]}"; do
         run_staged_system "$staged_runner" "$system" &
         child_pid="$!"
-        ACTIVE_RUNNERS+=("$child_pid")
+        ACTIVE_RUNNERS=("$child_pid")
         log "Launched $system runner pid=$child_pid"
-    done
 
-    for idx in "${!ACTIVE_RUNNERS[@]}"; do
         set +e
-        wait "${ACTIVE_RUNNERS[$idx]}"
+        wait "$child_pid"
         child_rc=$?
         set -e
-        log "Finished ${systems[$idx]} runner pid=${ACTIVE_RUNNERS[$idx]} exit_code=$child_rc"
+        ACTIVE_RUNNERS=()
+        log "Finished $system runner pid=$child_pid exit_code=$child_rc"
         if [[ "$child_rc" -ne 0 ]]; then
             rc=1
+            if [[ "${CONTINUE_ON_ERROR:-0}" != "1" ]]; then
+                log "Skipping remaining systems because $system failed"
+                break
+            fi
         fi
     done
-    ACTIVE_RUNNERS=()
-
-    if ((MPS_STARTED)); then
-        echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
-        MPS_STARTED=0
-        log "Stopped MPS after protein/water runners completed"
-    fi
 
     if ! save_results "$rc"; then
         log "WARNING: failed to save staged results from $STAGE_ROOT to $RESULT_DIR"
@@ -566,6 +571,7 @@ run_job_task() {
 
 main() {
     parse_args "$@"
+    resolve_dataset
 
     if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         submit_jobs "$@"

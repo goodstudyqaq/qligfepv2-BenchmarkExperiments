@@ -3,11 +3,10 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CDK2_DIR="$SCRIPT_DIR"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-QDYN="${QDYN:-/home/shen/code/Q2/bin/qdyn}"
-QFEP="${QFEP:-/home/shen/code/Q2/src/q6/bin/q6/qfep}"
+QDYN="${QDYN:-/home/mcpi-02/code/Q/bin/qdyn}"
+QFEP="${QFEP:-/home/mcpi-02/code/Q/src/q6/bin/q6/qfep}"
 QGPU_MODULES="${QGPU_MODULES-OpenMPI/4.1.4-GCC-11.3.0 CUDA/12.6.0}"
 QGPU_MODULE_PURGE="${QGPU_MODULE_PURGE:-0}"
 GPU_ID="${GPU_ID:-${CUDA_VISIBLE_DEVICES:-0}}"
@@ -15,10 +14,10 @@ GPU_ID="${GPU_ID%%,*}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$GPU_ID}"
 
 METRIC_INTERVAL="${METRIC_INTERVAL:-5}"
-METRICS_DIR="${METRICS_DIR:-$CDK2_DIR/metrics}"
-RAW_METRICS_DIR="$METRICS_DIR/raw"
-SUMMARY_FILE="$METRICS_DIR/cdk2_qgpu_batch_summary.tsv"
-STATUS_FILE="$METRICS_DIR/current_batch_status.tsv"
+METRICS_DIR="${METRICS_DIR:-}"
+RAW_METRICS_DIR=""
+SUMMARY_FILE=""
+STATUS_FILE=""
 QDYN_FAILURE_LOG_LINES="${QDYN_FAILURE_LOG_LINES:-120}"
 QDYN_FAILURE_ERR_LINES="${QDYN_FAILURE_ERR_LINES:-80}"
 
@@ -29,6 +28,8 @@ REPLICATES="${REPLICATES:-10}"
 QGPU_DISABLE_WATER_POLX="${QGPU_DISABLE_WATER_POLX:-0}"
 
 ONLY=""
+DATASET="${QGPU_DATASET_DIR:-}"
+DATASET_DIR=""
 LIMIT=0
 DRY_RUN=0
 SYSTEM_FILTER="both"
@@ -43,24 +44,27 @@ exec 3>&1
 usage() {
     cat <<'EOF'
 Usage:
-  ./run_qgpu_batch_local.sh [options]
+  ./run_qgpu_batch_local.sh --dataset DATASET [options]
 
 Options:
+  --dataset VALUE    Dataset name under perturbations (e.g. cdk2 or hif2a), or its path.
   --only VALUE       Run one FEP pair by name, e.g. FEP_1h1q_1oiu, or one system path.
   --system VALUE     For FEP names, run protein, water, or both. Default: both.
-  --replicates N    Batch the first N replicates into each qdyn launch. Default: 10.
-  --limit N         Run the first N FEP pairs in the default order.
-  --dry-run         Print execution order without running qdyn.
-  -h, --help        Show this help.
+  --replicates N     Batch the first N replicates into each qdyn launch. Default: 10.
+  --limit N          Run the first N FEP pairs in the default order.
+  --dry-run          Print execution order without running qdyn.
+  -h, --help         Show this help.
 
 Environment:
-  QDYN=/path/to/qdyn                  Default: /home/shen/code/Q2/bin/qdyn
-  QFEP=/path/to/qfep                  Default: /home/shen/code/Q2/src/q6/bin/q6/qfep
+  QGPU_DATASET_DIR=cdk2               Alternative to --dataset.
+  QDYN=/path/to/qdyn                  Default: /home/mcpi-02/code/Q/bin/qdyn
+  QFEP=/path/to/qfep                  Default: /home/mcpi-02/code/Q/src/q6/bin/q6/qfep
   QGPU_MODULES="OpenMPI/4.1.4-GCC-11.3.0 CUDA/12.6.0"
                                       Runtime modules loaded before running qdyn. Set to empty to disable.
   QGPU_MODULE_PURGE=0                 Set to 1 to run module purge before loading QGPU_MODULES.
   GPU_ID=0                            GPU passed to nvidia-smi; also used for CUDA_VISIBLE_DEVICES if unset.
   CUDA_VISIBLE_DEVICES=0              GPU visible to qdyn.
+  METRICS_DIR=DATASET/metrics         Metrics output directory.
   METRIC_INTERVAL=5                   Sampling interval in seconds.
   CLEAN_AFTER=1                       Clean each replicate run directory after successful qfep.
   KEEP_QFEP_ONLY=1                    With CLEAN_AFTER=1, keep only qfep.out in each replicate run directory.
@@ -89,6 +93,11 @@ die() {
 parse_args() {
     while (($#)); do
         case "$1" in
+            --dataset)
+                [[ $# -ge 2 ]] || die "--dataset requires a value"
+                DATASET="$2"
+                shift 2
+                ;;
             --only)
                 [[ $# -ge 2 ]] || die "--only requires a value"
                 ONLY="$2"
@@ -128,6 +137,30 @@ parse_args() {
     [[ "$REPLICATES" =~ ^[1-9][0-9]*$ ]] || die "REPLICATES must be a positive integer"
     [[ "$QGPU_DISABLE_WATER_POLX" == "0" || "$QGPU_DISABLE_WATER_POLX" == "1" ]] || die "QGPU_DISABLE_WATER_POLX must be 0 or 1"
     [[ "$QGPU_MODULE_PURGE" == "0" || "$QGPU_MODULE_PURGE" == "1" ]] || die "QGPU_MODULE_PURGE must be 0 or 1"
+}
+
+resolve_dataset() {
+    [[ -n "$DATASET" ]] || die "--dataset is required (for example: --dataset cdk2)"
+
+    if [[ -d "$DATASET" ]]; then
+        DATASET_DIR="$(cd "$DATASET" && pwd)"
+    elif [[ -d "$SCRIPT_DIR/$DATASET" ]]; then
+        DATASET_DIR="$(cd "$SCRIPT_DIR/$DATASET" && pwd)"
+    elif [[ -d "$REPO_ROOT/$DATASET" ]]; then
+        DATASET_DIR="$(cd "$REPO_ROOT/$DATASET" && pwd)"
+    else
+        die "Dataset is neither an existing path nor a directory under perturbations: $DATASET"
+    fi
+
+    [[ -d "$DATASET_DIR/2.protein" || -d "$DATASET_DIR/1.water" ]] || \
+        die "Dataset has neither 2.protein nor 1.water: $DATASET_DIR"
+}
+
+configure_metrics_paths() {
+    METRICS_DIR="${METRICS_DIR:-$DATASET_DIR/metrics}"
+    RAW_METRICS_DIR="$METRICS_DIR/raw"
+    SUMMARY_FILE="$METRICS_DIR/qgpu_batch_summary.tsv"
+    STATUS_FILE="$METRICS_DIR/current_batch_status.tsv"
 }
 
 init_environment_modules() {
@@ -867,9 +900,16 @@ resolve_targets() {
             die "--only value is neither an existing path nor an FEP name: $ONLY"
         fi
     else
+        local discovery_dir
+        if [[ "$SYSTEM_FILTER" == "water" ]]; then
+            discovery_dir="$DATASET_DIR/1.water"
+        else
+            discovery_dir="$DATASET_DIR/2.protein"
+        fi
+        [[ -d "$discovery_dir" ]] || die "Missing discovery directory: $discovery_dir"
         while IFS= read -r fep; do
             fep_names+=("$fep")
-        done < <(find "$CDK2_DIR/2.protein" -maxdepth 1 -type d -name 'FEP_*' -printf '%f\n' | sort)
+        done < <(find "$discovery_dir" -maxdepth 1 -type d -name 'FEP_*' -printf '%f\n' | sort)
     fi
 
     if ((${#fep_names[@]})); then
@@ -880,7 +920,7 @@ resolve_targets() {
                 break
             fi
             for system_dir in "${system_dirs[@]}"; do
-                path="$CDK2_DIR/$system_dir/$fep_name"
+                path="$DATASET_DIR/$system_dir/$fep_name"
                 [[ -d "$path/inputfiles" ]] || die "Missing paired system path: $path"
                 targets+=("$path")
             done
@@ -893,6 +933,8 @@ resolve_targets() {
 
 main() {
     parse_args "$@"
+    resolve_dataset
+    configure_metrics_paths
     mapfile -t targets < <(resolve_targets)
     ((${#targets[@]})) || die "No FEP targets resolved"
 
@@ -909,6 +951,7 @@ main() {
 
     log "QDYN=$QDYN"
     log "QFEP=$QFEP"
+    log "DATASET_DIR=$DATASET_DIR"
     log "GPU_ID=$GPU_ID CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     log "Metrics summary: $SUMMARY_FILE"
 
