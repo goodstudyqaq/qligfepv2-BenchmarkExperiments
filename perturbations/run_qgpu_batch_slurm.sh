@@ -49,14 +49,17 @@ usage() {
 Usage:
   ./run_qgpu_batch_slurm.sh --dataset DATASET [options]
 
-Submits one Slurm job per FEP edge. Each job requests one GPU, copies the
-selected inputfiles into QGPU_OUTPUT_BASE, then runs directly in that shared
-result directory. Protein and water run sequentially without CUDA MPS; each
-qdyn process batches all replicas for one system and simulation stage:
+Submits one Slurm job per FEP edge. Before submission, the selected inputfiles
+are copied from the source dataset to QGPU_SCRATCH_BASE/DATASET. Each job
+requests one GPU, copies its inputfiles into QGPU_OUTPUT_BASE, then runs
+directly in that shared result directory. Protein and water run sequentially
+without CUDA MPS; each qdyn process batches all replicas for one system and
+simulation stage:
   ./run_qgpu_batch_local.sh --dataset DATASET --only EDGE --system VALUE
 
 Options:
-  --dataset VALUE    Dataset name under QGPU_SCRATCH_BASE (e.g. cdk2 or hif2a), or its path.
+  --dataset VALUE    Source dataset name under perturbations (e.g. cdk2 or
+                     hif2a), or its path. Selected inputs are copied to scratch.
   --only VALUE       Submit one FEP edge by name, e.g. FEP_1h1q_1oiu, or one system path.
   --system VALUE     Run protein, water, or both. "both" runs them sequentially. Default: both.
   --replicates N     Number of replicas batched into each qdyn process. Default: runner default.
@@ -73,9 +76,9 @@ Environment:
   JOB_NAME=qgpu_DATASET               Slurm job name. Defaults to the resolved
                                       dataset name, e.g. qgpu_cdk2.
   QGPU_SCRATCH_BASE=/scratch-shared/$USER/qgpu_batch
-                                      Shared base containing dataset directories,
+                                      Shared base for staged dataset inputs,
                                       Slurm logs, and live results. For example,
-                                      cdk2 is read from $QGPU_SCRATCH_BASE/cdk2.
+                                      cdk2 is staged in $QGPU_SCRATCH_BASE/cdk2.
   QGPU_OUTPUT_BASE=$QGPU_SCRATCH_BASE/jobs
                                       Shared directory where jobs read inputs and write outputs.
   QGPU_CLEAN_EXTENSIONS=dcd,log       Extensions removed after a successful run.
@@ -203,10 +206,14 @@ resolve_dataset() {
     if [[ "$DATASET" == */* ]]; then
         [[ -d "$DATASET" ]] || die "Dataset path does not exist: $DATASET"
         DATASET_DIR="$(cd "$DATASET" && pwd)"
+    elif [[ -d "$SCRIPT_DIR/$DATASET" ]]; then
+        DATASET_DIR="$(cd "$SCRIPT_DIR/$DATASET" && pwd)"
+    elif [[ -d "$REPO_ROOT/$DATASET" ]]; then
+        DATASET_DIR="$(cd "$REPO_ROOT/$DATASET" && pwd)"
     elif [[ -d "$QGPU_SCRATCH_BASE/$DATASET" ]]; then
         DATASET_DIR="$(cd "$QGPU_SCRATCH_BASE/$DATASET" && pwd)"
     else
-        die "Dataset not found under QGPU_SCRATCH_BASE: $QGPU_SCRATCH_BASE/$DATASET"
+        die "Dataset is neither an existing path nor a directory under perturbations or QGPU_SCRATCH_BASE: $DATASET"
     fi
 
     [[ -d "$DATASET_DIR/2.protein" || -d "$DATASET_DIR/1.water" ]] || \
@@ -353,6 +360,53 @@ build_child_args() {
     fi
 }
 
+stage_submission_inputs() {
+    local targets_name="$1"
+    local -n targets_ref="$targets_name"
+    local source_dataset="$DATASET_DIR"
+    local dataset_name scratch_dataset target system_dir fep_name i
+    local system_dirs=()
+
+    dataset_name="$(basename "$source_dataset")"
+    scratch_dataset="$QGPU_SCRATCH_BASE/$dataset_name"
+
+    if [[ "$source_dataset" == "$scratch_dataset" ]]; then
+        log "Dataset inputs already reside in scratch: $scratch_dataset"
+        return 0
+    fi
+
+    log "Staging selected inputs: $source_dataset -> $scratch_dataset"
+    for i in "${!targets_ref[@]}"; do
+        target="${targets_ref[$i]}"
+        if [[ "$target" == FEP_* ]]; then
+            mapfile -t system_dirs < <(system_dirs_for_filter)
+            for system_dir in "${system_dirs[@]}"; do
+                if ((SUBMIT_DRY_RUN)); then
+                    printf 'Would copy %s/inputfiles -> %s/%s/%s/inputfiles\n' \
+                        "$source_dataset/$system_dir/$target" \
+                        "$scratch_dataset" "$system_dir" "$target"
+                else
+                    stage_system_path \
+                        "$source_dataset/$system_dir/$target" \
+                        "$scratch_dataset" >/dev/null
+                fi
+            done
+        else
+            system_dir="$(basename "$(dirname "$target")")"
+            fep_name="$(basename "$target")"
+            if ((SUBMIT_DRY_RUN)); then
+                printf 'Would copy %s/inputfiles -> %s/%s/%s/inputfiles\n' \
+                    "$target" "$scratch_dataset" "$system_dir" "$fep_name"
+            else
+                stage_system_path "$target" "$scratch_dataset" >/dev/null
+            fi
+            targets_ref[$i]="$scratch_dataset/$system_dir/$fep_name"
+        fi
+    done
+
+    DATASET_DIR="$scratch_dataset"
+}
+
 submit_jobs() {
     local targets=()
     local target
@@ -365,6 +419,7 @@ submit_jobs() {
     [[ -x "$RUNNER" ]] || die "Runner is not executable: $RUNNER"
 
     mapfile -t targets < <(resolve_targets)
+    stage_submission_inputs targets
     mkdir -p "$LOG_DIR"
 
     printf 'Resolved %d target(s):\n' "${#targets[@]}"
