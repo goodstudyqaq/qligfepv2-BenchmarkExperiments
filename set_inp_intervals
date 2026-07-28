@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+
+import re
+import sys
+from pathlib import Path
+
+
+if len(sys.argv) != 2:
+    sys.exit(f"Usage: {Path(sys.argv[0]).name} SYSTEM\nExample: {Path(sys.argv[0]).name} cdk2")
+
+system = sys.argv[1]
+root = Path(__file__).resolve().parent / "perturbations" / system
+
+if not root.is_dir():
+    sys.exit(f"Error: {root} does not exist")
+
+section = re.compile(r"^\s*\[([^\]]+)\]")
+setting = re.compile(r"^(\s*)(output|trajectory)(\s+)\S+(.*)$", re.IGNORECASE)
+changed = 0
+
+for path in root.glob("**/inputfiles/*.inp"):
+    lines = path.read_text().splitlines(keepends=True)
+    in_intervals = False
+    new_lines = []
+
+    for line in lines:
+        match = section.match(line)
+        if match:
+            in_intervals = match.group(1).strip().lower() == "intervals"
+
+        match = setting.match(line) if in_intervals else None
+        if match:
+            ending = "\n" if line.endswith("\n") else ""
+            line = f"{match.group(1)}{match.group(2)}{match.group(3)}0{match.group(4).rstrip()}{ending}"
+
+        new_lines.append(line)
+
+    new_text = "".join(new_lines)
+    old_text = "".join(lines)
+    if new_text != old_text:
+        path.write_text(new_text)
+        changed += 1
+
+print(f"Changed {changed} input files for {system}.")
