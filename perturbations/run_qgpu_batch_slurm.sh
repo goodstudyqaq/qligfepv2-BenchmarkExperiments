@@ -20,10 +20,11 @@ SBATCH_CONSTRAINT="${SBATCH_CONSTRAINT:-}"
 SBATCH_GPU_BIND="${SBATCH_GPU_BIND:-}"
 QGPU_USER="${USER:-${LOGNAME:-user}}"
 QGPU_SCRATCH_BASE="${QGPU_SCRATCH_BASE:-/scratch-shared/$QGPU_USER/qgpu_batch}"
-QGPU_OUTPUT_BASE="${QGPU_OUTPUT_BASE:-$QGPU_SCRATCH_BASE/jobs}"
+QGPU_OUTPUT_BASE="${QGPU_OUTPUT_BASE:-}"
 QGPU_CLEAN_EXTENSIONS="${QGPU_CLEAN_EXTENSIONS-dcd,log}"
+QGPU_KEEP_ONLY="${QGPU_KEEP_ONLY-}"
 QGPU_CLEAN_ON_FAILURE="${QGPU_CLEAN_ON_FAILURE:-0}"
-LOG_DIR="${LOG_DIR:-$QGPU_SCRATCH_BASE/logs}"
+LOG_DIR="${LOG_DIR:-}"
 
 ONLY=""
 DATASET="${QGPU_DATASET_DIR:-}"
@@ -34,6 +35,9 @@ REPLICATES_OVERRIDE=""
 CLEAN_EXTENSIONS_RAW="$QGPU_CLEAN_EXTENSIONS"
 CLEAN_EXTENSIONS=()
 CLEAN_EXTENSIONS_CSV=""
+KEEP_ONLY_RAW="$QGPU_KEEP_ONLY"
+KEEP_ONLY=()
+KEEP_ONLY_CSV=""
 IGNORED_ARRAY_MAX_CONCURRENT=""
 SUBMIT_DRY_RUN=0
 STAGE_ROOT=""
@@ -66,6 +70,8 @@ Options:
   --clean-extensions LIST
                      Comma- or space-separated extensions to remove after a
                      successful run. Default: dcd,log. Example: dcd,log,inp
+  --keep-only LIST   In each job's work directory, keep only the listed
+                     extensions or exact filenames. Example: en,qfep.out
   --no-clean         Keep all generated and copied files.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
@@ -79,12 +85,17 @@ Environment:
                                       Shared base for staged dataset inputs,
                                       Slurm logs, and live results. For example,
                                       cdk2 is staged in $QGPU_SCRATCH_BASE/cdk2.
-  QGPU_OUTPUT_BASE=$QGPU_SCRATCH_BASE/jobs
-                                      Shared directory where jobs read inputs and write outputs.
+  QGPU_OUTPUT_BASE=$QGPU_SCRATCH_BASE/DATASET/jobs
+                                      Dataset-specific directory where jobs
+                                      read inputs and write outputs.
   QGPU_CLEAN_EXTENSIONS=dcd,log       Extensions removed after a successful run.
                                       Leading dots are optional; use an empty value to disable.
+  QGPU_KEEP_ONLY=en,qfep.out          Keep only these files in each result work
+                                      tree. Exact names contain a dot; other
+                                      values are treated as extensions.
   QGPU_CLEAN_ON_FAILURE=0             Also clean selected extensions after a failed run.
-  LOG_DIR=$QGPU_SCRATCH_BASE/logs     Directory for Slurm stdout logs.
+  LOG_DIR=$QGPU_SCRATCH_BASE/DATASET/logs
+                                      Dataset-specific Slurm stdout directory.
   SBATCH_TIME=12:00:00                Slurm wall time.
   SBATCH_CPUS_PER_TASK=8              CPUs allocated to each edge task.
   SBATCH_MEM=48G                      Memory allocated to each edge task.
@@ -136,6 +147,30 @@ normalize_clean_extensions() {
     fi
 }
 
+normalize_keep_only() {
+    local value
+    local normalized="${KEEP_ONLY_RAW//,/ }"
+    local values=()
+
+    KEEP_ONLY=()
+    read -r -a values <<< "$normalized"
+    for value in "${values[@]}"; do
+        value="${value#.}"
+        [[ -n "$value" ]] || continue
+        [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || \
+            die "Invalid keep-only value: $value"
+        if [[ " ${KEEP_ONLY[*]} " != *" $value "* ]]; then
+            KEEP_ONLY+=("$value")
+        fi
+    done
+
+    if ((${#KEEP_ONLY[@]})); then
+        KEEP_ONLY_CSV="$(IFS=,; printf '%s' "${KEEP_ONLY[*]}")"
+    else
+        KEEP_ONLY_CSV=""
+    fi
+}
+
 parse_args() {
     while (($#)); do
         case "$1" in
@@ -164,10 +199,17 @@ parse_args() {
             --clean-extensions|--clean)
                 [[ $# -ge 2 ]] || die "$1 requires a comma- or space-separated list"
                 CLEAN_EXTENSIONS_RAW="$2"
+                KEEP_ONLY_RAW=""
+                shift 2
+                ;;
+            --keep-only)
+                [[ $# -ge 2 ]] || die "--keep-only requires a comma- or space-separated list"
+                KEEP_ONLY_RAW="$2"
                 shift 2
                 ;;
             --no-clean)
                 CLEAN_EXTENSIONS_RAW=""
+                KEEP_ONLY_RAW=""
                 shift
                 ;;
             --array-max-concurrent)
@@ -198,6 +240,7 @@ parse_args() {
     [[ "$QGPU_CLEAN_ON_FAILURE" == "0" || "$QGPU_CLEAN_ON_FAILURE" == "1" ]] || \
         die "QGPU_CLEAN_ON_FAILURE must be 0 or 1"
     normalize_clean_extensions
+    normalize_keep_only
 }
 
 resolve_dataset() {
@@ -228,6 +271,13 @@ configure_job_name() {
     if [[ -z "$JOB_NAME" ]]; then
         JOB_NAME="qgpu_$(safe_tag "$(basename "$DATASET_DIR")")"
     fi
+}
+
+configure_dataset_storage() {
+    local dataset_name
+    dataset_name="$(basename "$DATASET_DIR")"
+    QGPU_OUTPUT_BASE="${QGPU_OUTPUT_BASE:-$QGPU_SCRATCH_BASE/$dataset_name/jobs}"
+    LOG_DIR="${LOG_DIR:-$QGPU_SCRATCH_BASE/$dataset_name/logs}"
 }
 
 system_dirs_for_filter() {
@@ -357,6 +407,9 @@ build_child_args() {
         printf '%s\0' "--clean-extensions" "$CLEAN_EXTENSIONS_CSV"
     else
         printf '%s\0' "--no-clean"
+    fi
+    if [[ -n "$KEEP_ONLY_CSV" ]]; then
+        printf '%s\0' "--keep-only" "$KEEP_ONLY_CSV"
     fi
 }
 
@@ -496,6 +549,7 @@ write_run_info() {
         printf 'metrics_dir\t%s\n' "$METRICS_DIR"
         printf 'result_dir\t%s\n' "$RESULT_DIR"
         printf 'clean_extensions\t%s\n' "${CLEAN_EXTENSIONS_CSV:-none}"
+        printf 'keep_only\t%s\n' "${KEEP_ONLY_CSV:-none}"
         printf 'clean_on_failure\t%s\n' "$QGPU_CLEAN_ON_FAILURE"
         printf 'exit_code\t%s\n' "$rc"
     } > "$RESULT_DIR/run_info.tsv"
@@ -503,10 +557,31 @@ write_run_info() {
 
 clean_selected_outputs() {
     local rc="$1"
-    local ext count
+    local ext count file base rule keep
 
     if [[ "$rc" -ne 0 && "$QGPU_CLEAN_ON_FAILURE" != "1" ]]; then
         log "Keeping all files because the run failed with exit code $rc"
+        return 0
+    fi
+    if ((${#KEEP_ONLY[@]})); then
+        count=0
+        while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            keep=0
+            for rule in "${KEEP_ONLY[@]}"; do
+                if [[ "$rule" == *.* ]]; then
+                    [[ "$base" == "$rule" ]] && keep=1
+                else
+                    [[ "$base" == "$rule" || "$base" == *".$rule" ]] && keep=1
+                fi
+                ((keep)) && break
+            done
+            if (( ! keep )); then
+                rm -f -- "$file"
+                count=$((count + 1))
+            fi
+        done < <(find "$STAGE_ROOT" -type f -print0)
+        log "Removed $count non-matching file(s) from $STAGE_ROOT; kept ${KEEP_ONLY_CSV}"
         return 0
     fi
     if ((${#CLEAN_EXTENSIONS[@]} == 0)); then
@@ -698,6 +773,7 @@ main() {
     parse_args "$@"
     resolve_dataset
     configure_job_name
+    configure_dataset_storage
 
     if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         submit_jobs "$@"
