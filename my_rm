@@ -3,9 +3,9 @@
 set -Eeuo pipefail
 
 SCRIPT_PATH="$(realpath -e -- "${BASH_SOURCE[0]}")"
-MY_RM_PARTITION="${MY_RM_PARTITION:-cbuild}"
+MY_RM_PARTITION="${MY_RM_PARTITION:-rome}"
 MY_RM_TIME="${MY_RM_TIME:-08:00:00}"
-MY_RM_CPUS="${MY_RM_CPUS:-8}"
+MY_RM_CPUS="${MY_RM_CPUS:-16}"
 MY_RM_LOG_DIR="${MY_RM_LOG_DIR:-$(pwd -P)}"
 
 usage() {
@@ -22,9 +22,9 @@ Options:
   -h, --help    Show this help.
 
 Environment:
-  MY_RM_PARTITION=cbuild    Slurm partition.
+  MY_RM_PARTITION=rome      Slurm partition.
   MY_RM_TIME=08:00:00       Slurm wall time.
-  MY_RM_CPUS=8              Concurrent rm processes and allocated CPUs.
+  MY_RM_CPUS=16             Concurrent rm processes and allocated CPUs.
   MY_RM_LOG_DIR=$PWD        Directory for my_rm.<job-id>.log.
 EOF
 }
@@ -201,7 +201,9 @@ submit_main() {
         print_command "${command[@]}"
     else
         command -v sbatch >/dev/null || die "sbatch is required"
-        "${command[@]}"
+        if ! "${command[@]}"; then
+            die "Slurm rejected the cleanup job. Inspect available CPU partitions with: sinfo -o '%P %a %l %c'. Override with MY_RM_PARTITION=NAME, MY_RM_CPUS=N, or MY_RM_TIME=HH:MM:SS."
+        fi
     fi
 }
 
