@@ -7,7 +7,7 @@ SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNNER="${QGPU_SCRIPT_DIR:-$SCRIPT_DIR}/run_qgpu_batch_local.sh"
 
-JOB_NAME="${JOB_NAME:-qgpu-batch}"
+JOB_NAME="${JOB_NAME:-}"
 SBATCH_TIME="${SBATCH_TIME:-12:00:00}"
 SBATCH_CPUS_PER_TASK="${SBATCH_CPUS_PER_TASK:-8}"
 SBATCH_MEM="${SBATCH_MEM:-48G}"
@@ -19,7 +19,7 @@ SBATCH_QOS="${SBATCH_QOS:-}"
 SBATCH_CONSTRAINT="${SBATCH_CONSTRAINT:-}"
 SBATCH_GPU_BIND="${SBATCH_GPU_BIND:-}"
 QGPU_USER="${USER:-${LOGNAME:-user}}"
-QGPU_SCRATCH_BASE="${QGPU_SCRATCH_BASE:-/scratch/$QGPU_USER/qgpu_batch}"
+QGPU_SCRATCH_BASE="${QGPU_SCRATCH_BASE:-/scratch-shared/$QGPU_USER/qgpu_batch}"
 QGPU_OUTPUT_BASE="${QGPU_OUTPUT_BASE:-$QGPU_SCRATCH_BASE/jobs}"
 QGPU_CLEAN_EXTENSIONS="${QGPU_CLEAN_EXTENSIONS-dcd,log}"
 QGPU_CLEAN_ON_FAILURE="${QGPU_CLEAN_ON_FAILURE:-0}"
@@ -56,7 +56,7 @@ qdyn process batches all replicas for one system and simulation stage:
   ./run_qgpu_batch_local.sh --dataset DATASET --only EDGE --system VALUE
 
 Options:
-  --dataset VALUE    Dataset name under perturbations (e.g. cdk2 or hif2a), or its path.
+  --dataset VALUE    Dataset name under QGPU_SCRATCH_BASE (e.g. cdk2 or hif2a), or its path.
   --only VALUE       Submit one FEP edge by name, e.g. FEP_1h1q_1oiu, or one system path.
   --system VALUE     Run protein, water, or both. "both" runs them sequentially. Default: both.
   --replicates N     Number of replicas batched into each qdyn process. Default: runner default.
@@ -70,9 +70,12 @@ Options:
 
 Environment:
   QGPU_DATASET_DIR=cdk2               Alternative to --dataset.
-  JOB_NAME=qgpu-batch                 Slurm job name.
-  QGPU_SCRATCH_BASE=/scratch/$USER/qgpu_batch
-                                      Shared base for Slurm logs and live results.
+  JOB_NAME=qgpu_DATASET               Slurm job name. Defaults to the resolved
+                                      dataset name, e.g. qgpu_cdk2.
+  QGPU_SCRATCH_BASE=/scratch-shared/$USER/qgpu_batch
+                                      Shared base containing dataset directories,
+                                      Slurm logs, and live results. For example,
+                                      cdk2 is read from $QGPU_SCRATCH_BASE/cdk2.
   QGPU_OUTPUT_BASE=$QGPU_SCRATCH_BASE/jobs
                                       Shared directory where jobs read inputs and write outputs.
   QGPU_CLEAN_EXTENSIONS=dcd,log       Extensions removed after a successful run.
@@ -197,14 +200,13 @@ parse_args() {
 resolve_dataset() {
     [[ -n "$DATASET" ]] || die "--dataset is required (for example: --dataset cdk2)"
 
-    if [[ -d "$DATASET" ]]; then
+    if [[ "$DATASET" == */* ]]; then
+        [[ -d "$DATASET" ]] || die "Dataset path does not exist: $DATASET"
         DATASET_DIR="$(cd "$DATASET" && pwd)"
-    elif [[ -d "$SCRIPT_DIR/$DATASET" ]]; then
-        DATASET_DIR="$(cd "$SCRIPT_DIR/$DATASET" && pwd)"
-    elif [[ -d "$REPO_ROOT/$DATASET" ]]; then
-        DATASET_DIR="$(cd "$REPO_ROOT/$DATASET" && pwd)"
+    elif [[ -d "$QGPU_SCRATCH_BASE/$DATASET" ]]; then
+        DATASET_DIR="$(cd "$QGPU_SCRATCH_BASE/$DATASET" && pwd)"
     else
-        die "Dataset is neither an existing path nor a directory under perturbations: $DATASET"
+        die "Dataset not found under QGPU_SCRATCH_BASE: $QGPU_SCRATCH_BASE/$DATASET"
     fi
 
     [[ -d "$DATASET_DIR/2.protein" || -d "$DATASET_DIR/1.water" ]] || \
@@ -213,6 +215,12 @@ resolve_dataset() {
 
 safe_tag() {
     printf '%s' "$1" | sed 's#[^A-Za-z0-9_.-]#_#g'
+}
+
+configure_job_name() {
+    if [[ -z "$JOB_NAME" ]]; then
+        JOB_NAME="qgpu_$(safe_tag "$(basename "$DATASET_DIR")")"
+    fi
 }
 
 system_dirs_for_filter() {
@@ -634,6 +642,7 @@ run_job_task() {
 main() {
     parse_args "$@"
     resolve_dataset
+    configure_job_name
 
     if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         submit_jobs "$@"
