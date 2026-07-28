@@ -41,11 +41,12 @@ KEEP_ONLY_CSV=""
 IGNORED_ARRAY_MAX_CONCURRENT=""
 SUBMIT_DRY_RUN=0
 MPS_STARTED=0
-STAGE_ROOT=""
 RESULT_DIR=""
 RUN_TARGET=""
-STAGED_TARGET=""
 RESULT_SAVED=0
+RUN_ROOTS=()
+OUTPUT_ROOTS=()
+LOCK_DIRS=()
 
 usage() {
     cat <<'EOF'
@@ -54,9 +55,12 @@ Usage:
 
 Submits one Slurm job per FEP edge. Before submission, the selected inputfiles
 are copied from the source dataset to QGPU_SCRATCH_BASE/DATASET. Each job
-requests one GPU, copies its inputfiles into QGPU_OUTPUT_BASE, starts a private
-MPS daemon, then runs directly in that shared result directory:
+requests one GPU, starts a private MPS daemon, then runs directly in the staged
+scratch FEP directories. Generated FEP1 output is therefore written beside the
+staged inputfiles:
   ./run_qgpu_mps_local.sh --only EDGE --system VALUE
+For safety, a job refuses to start if that FEP1 directory already exists or
+another job has locked the same staged FEP workspace.
 
 Options:
   --dataset VALUE    Source dataset name under perturbations (e.g. cdk2 or
@@ -67,9 +71,10 @@ Options:
   --clean-extensions LIST
                      Comma- or space-separated extensions to remove after a
                      successful run. Default: dcd,log. Example: dcd,log,inp
-  --keep-only LIST   In each job's work directory, keep only the listed
-                     extensions or exact filenames. Example: en,qfep.out
-  --no-clean         Keep all generated and copied files.
+  --keep-only LIST   Keep only the listed extensions or exact filenames under
+                     each generated FEP1 directory.
+                     Example: en,qfep.out
+  --no-clean         Keep all generated files.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
   -h, --help        Show this help.
@@ -83,12 +88,13 @@ Environment:
                                       Slurm logs, and live results. For example,
                                       cdk2 is staged in $QGPU_SCRATCH_BASE/cdk2.
   QGPU_OUTPUT_BASE=$QGPU_SCRATCH_BASE/DATASET/jobs
-                                      Dataset-specific directory where jobs
-                                      read inputs and write outputs.
+                                      Dataset-specific directory for per-job
+                                      metrics and metadata. Simulation output
+                                      is written below the staged FEP directories.
   QGPU_CLEAN_EXTENSIONS=dcd,log       Extensions removed after a successful run.
                                       Leading dots are optional; use an empty value to disable.
-  QGPU_KEEP_ONLY=en,qfep.out          Keep only these files in each result work
-                                      tree. Exact names contain a dot; other
+  QGPU_KEEP_ONLY=en,qfep.out          Keep only these files in each generated
+                                      FEP1 tree. Exact names contain a dot; other
                                       values are treated as extensions.
   QGPU_CLEAN_ON_FAILURE=0             Also clean selected extensions after a failed run.
   LOG_DIR=$QGPU_SCRATCH_BASE/DATASET/logs
@@ -423,6 +429,7 @@ stage_submission_inputs() {
 
     if [[ "$source_dataset" == "$scratch_dataset" ]]; then
         log "Dataset inputs already reside in scratch: $scratch_dataset"
+        stage_dataset_runner "$scratch_dataset"
         return 0
     fi
 
@@ -455,6 +462,7 @@ stage_submission_inputs() {
         fi
     done
 
+    stage_dataset_runner "$scratch_dataset"
     DATASET_DIR="$scratch_dataset"
 }
 
@@ -517,27 +525,85 @@ stage_system_path() {
     printf '%s\n' "$dst"
 }
 
-stage_target() {
-    local target="$1"
-    local stage_root="$2"
-    local system_dir
+stage_dataset_runner() {
+    local stage_root="$1"
+    local dst tmp
+
+    # The local runner resolves 1.water and 2.protein relative to its own
+    # location, so install one copy at the staged dataset root.
+    dst="$stage_root/$(basename "$RUNNER")"
+    if ((SUBMIT_DRY_RUN)); then
+        printf 'Would install runner %s -> %s\n' "$RUNNER" "$dst"
+        return 0
+    fi
 
     mkdir -p "$stage_root"
-    cp -p "$RUNNER" "$stage_root/"
-    chmod +x "$stage_root/$(basename "$RUNNER")"
+    tmp="$dst.tmp.${BASHPID:-$$}"
+    cp -p "$RUNNER" "$tmp"
+    chmod +x "$tmp"
+    mv -f -- "$tmp" "$dst"
+}
 
+resolve_run_roots() {
+    local target="$1"
+    local system_dir root
+
+    RUN_ROOTS=()
+    OUTPUT_ROOTS=()
     if [[ "$target" == FEP_* ]]; then
         while IFS= read -r system_dir; do
-            stage_system_path "$DATASET_DIR/$system_dir/$target" "$stage_root" >/dev/null
+            root="$(cd "$DATASET_DIR/$system_dir/$target" && pwd)"
+            RUN_ROOTS+=("$root")
+            OUTPUT_ROOTS+=("$root/FEP1")
         done < <(system_dirs_for_filter)
-        printf '%s\n' "$target"
     else
-        stage_system_path "$target" "$stage_root"
+        root="$(cd "$target" && pwd)"
+        RUN_ROOTS+=("$root")
+        OUTPUT_ROOTS+=("$root/FEP1")
     fi
+}
+
+release_run_locks() {
+    local lock_dir
+
+    for lock_dir in "${LOCK_DIRS[@]}"; do
+        if ! rmdir -- "$lock_dir" 2>/dev/null && [[ -d "$lock_dir" ]]; then
+            log "WARNING: could not remove job lock directory: $lock_dir"
+        fi
+    done
+    LOCK_DIRS=()
+}
+
+acquire_run_locks() {
+    local root lock_dir
+
+    LOCK_DIRS=()
+    for root in "${RUN_ROOTS[@]}"; do
+        if [[ -e "$root/FEP1" ]]; then
+            release_run_locks
+            die "Output directory already exists; refusing to reuse it: $root/FEP1"
+        fi
+
+        lock_dir="$root/.qgpu_mps_slurm.lock"
+        if ! mkdir -- "$lock_dir"; then
+            release_run_locks
+            die "Another job may already own this FEP workspace: $root"
+        fi
+        LOCK_DIRS+=("$lock_dir")
+
+        if [[ -e "$root/FEP1" ]]; then
+            release_run_locks
+            die "Output directory appeared while reserving the workspace: $root/FEP1"
+        fi
+    done
 }
 
 write_run_info() {
     local rc="$1"
+    local run_roots_csv output_roots_csv
+
+    run_roots_csv="$(IFS=,; printf '%s' "${RUN_ROOTS[*]}")"
+    output_roots_csv="$(IFS=,; printf '%s' "${OUTPUT_ROOTS[*]}")"
 
     {
         printf 'key\tvalue\n'
@@ -545,11 +611,11 @@ write_run_info() {
         printf 'slurm_job_nodelist\t%s\n' "${SLURM_JOB_NODELIST:-unset}"
         printf 'target\t%s\n' "$RUN_TARGET"
         printf 'dataset_dir\t%s\n' "$DATASET_DIR"
-        printf 'staged_target\t%s\n' "$STAGED_TARGET"
+        printf 'input_roots\t%s\n' "$run_roots_csv"
+        printf 'output_roots\t%s\n' "$output_roots_csv"
         printf 'system_filter\t%s\n' "$SYSTEM_FILTER"
         printf 'replicates_override\t%s\n' "${REPLICATES_OVERRIDE:-runner_default}"
         printf 'script_dir\t%s\n' "$SCRIPT_DIR"
-        printf 'work_dir\t%s\n' "$STAGE_ROOT"
         printf 'metrics_dir\t%s\n' "$METRICS_DIR"
         printf 'result_dir\t%s\n' "$RESULT_DIR"
         printf 'clean_extensions\t%s\n' "${CLEAN_EXTENSIONS_CSV:-none}"
@@ -561,10 +627,18 @@ write_run_info() {
 
 clean_selected_outputs() {
     local rc="$1"
-    local ext count file base rule keep
+    local ext count file base rule keep output_root
+    local clean_roots=()
 
     if [[ "$rc" -ne 0 && "$QGPU_CLEAN_ON_FAILURE" != "1" ]]; then
         log "Keeping all files because the run failed with exit code $rc"
+        return 0
+    fi
+    for output_root in "${OUTPUT_ROOTS[@]}"; do
+        [[ -d "$output_root" ]] && clean_roots+=("$output_root")
+    done
+    if ((${#clean_roots[@]} == 0)); then
+        log "No generated FEP1 directories found to clean"
         return 0
     fi
     if ((${#KEEP_ONLY[@]})); then
@@ -584,8 +658,8 @@ clean_selected_outputs() {
                 rm -f -- "$file"
                 count=$((count + 1))
             fi
-        done < <(find "$STAGE_ROOT" -type f -print0)
-        log "Removed $count non-matching file(s) from $STAGE_ROOT; kept ${KEEP_ONLY_CSV}"
+        done < <(find "${clean_roots[@]}" -type f -print0)
+        log "Removed $count non-matching file(s) from generated FEP1 output; kept ${KEEP_ONLY_CSV}"
         return 0
     fi
     if ((${#CLEAN_EXTENSIONS[@]} == 0)); then
@@ -595,14 +669,14 @@ clean_selected_outputs() {
 
     for ext in "${CLEAN_EXTENSIONS[@]}"; do
         if ! count="$(
-            find "$RESULT_DIR" -type f -name "*.$ext" -printf '.\n' -delete |
+            find "${clean_roots[@]}" -type f -name "*.$ext" -printf '.\n' -delete |
                 wc -l
         )"; then
-            log "WARNING: failed while removing *.$ext files from $RESULT_DIR"
+            log "WARNING: failed while removing *.$ext files from generated FEP1 output"
             return 1
         fi
         count="${count//[[:space:]]/}"
-        log "Removed ${count:-0} *.$ext file(s) from $RESULT_DIR"
+        log "Removed ${count:-0} *.$ext file(s) from generated FEP1 output"
     done
 }
 
@@ -610,7 +684,7 @@ save_results() {
     local rc="$1"
 
     [[ "$RESULT_SAVED" == "0" ]] || return 0
-    [[ -n "$STAGE_ROOT" && -d "$STAGE_ROOT" && -n "$RESULT_DIR" ]] || return 0
+    [[ -n "$RESULT_DIR" ]] || return 0
 
     mkdir -p "$RESULT_DIR"
     printf '%s\n' "$rc" > "$RESULT_DIR/exit_code.txt"
@@ -660,7 +734,7 @@ cleanup() {
     local rc=$?
     trap - EXIT INT TERM
 
-    if [[ -n "$STAGE_ROOT" && -d "$STAGE_ROOT" && -n "$RESULT_DIR" && "$RESULT_SAVED" == "0" ]]; then
+    if [[ -n "$RESULT_DIR" && "$RESULT_SAVED" == "0" ]]; then
         if ! save_results "$rc"; then
             log "WARNING: failed to finalize results in $RESULT_DIR"
         fi
@@ -675,6 +749,7 @@ cleanup() {
         log "WARNING: failed to clean NVIDIA MPS data from ${TMPDIR:-unset}"
     fi
 
+    release_run_locks
     exit "$rc"
 }
 
@@ -716,7 +791,7 @@ ensure_single_visible_gpu() {
 }
 
 run_job_task() {
-    local target tag rc staged_runner
+    local target tag rc dataset_runner root
     local runner_args=()
 
     [[ -n "$ONLY" ]] || die "This Slurm job must be submitted with --only TARGET"
@@ -727,16 +802,20 @@ run_job_task() {
     require_mps_tmpdir
 
     RUN_TARGET="$target"
+    resolve_run_roots "$target"
     tag="$(target_tag "$target")"
     RESULT_DIR="$QGPU_OUTPUT_BASE/${SLURM_JOB_ID}_${tag}"
-    STAGE_ROOT="$RESULT_DIR/work"
     export METRICS_DIR="$RESULT_DIR/metrics"
+    dataset_runner="$DATASET_DIR/$(basename "$RUNNER")"
 
-    mkdir -p "$RESULT_DIR"
-    [[ ! -e "$STAGE_ROOT" ]] || die "Work directory already exists; refusing to overwrite it: $STAGE_ROOT"
-    STAGED_TARGET="$(stage_target "$target" "$STAGE_ROOT")"
-    staged_runner="$STAGE_ROOT/$(basename "$RUNNER")"
-    mkdir -p "$METRICS_DIR"
+    mkdir -p "$RESULT_DIR" "$METRICS_DIR"
+
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    [[ -x "$dataset_runner" ]] || die "Staged dataset runner is not executable: $dataset_runner"
+    acquire_run_locks
 
     log "SLURM_JOB_ID=$SLURM_JOB_ID"
     log "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-unset}"
@@ -745,21 +824,18 @@ run_job_task() {
     log "SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-unset}"
     log "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-unset}"
     log "Target=$target"
-    log "Shared work dir=$STAGE_ROOT"
-    log "Staged target=$STAGED_TARGET"
+    for root in "${RUN_ROOTS[@]}"; do
+        log "Scratch FEP workspace=$root"
+    done
     log "Result dir=$RESULT_DIR"
     log "METRICS_DIR=$METRICS_DIR"
     log "Cleanup extensions=${CLEAN_EXTENSIONS_CSV:-none}"
-
-    trap cleanup EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
 
     ensure_single_visible_gpu
     log "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     start_mps
 
-    runner_args=(--only "$STAGED_TARGET" --system "$SYSTEM_FILTER")
+    runner_args=(--only "$target" --system "$SYSTEM_FILTER")
     if [[ -n "$REPLICATES_OVERRIDE" ]]; then
         runner_args+=(--replicates "$REPLICATES_OVERRIDE")
     fi
@@ -769,12 +845,12 @@ run_job_task() {
     export CLEAN_AFTER=0
 
     set +e
-    "$staged_runner" "${runner_args[@]}"
+    "$dataset_runner" "${runner_args[@]}"
     rc=$?
     set -e
 
     if ! clean_selected_outputs "$rc"; then
-        log "WARNING: failed to clean selected extensions in $RESULT_DIR"
+        log "WARNING: failed to clean selected extensions in generated FEP1 output"
         if [[ "$rc" -eq 0 ]]; then
             rc=1
         fi
