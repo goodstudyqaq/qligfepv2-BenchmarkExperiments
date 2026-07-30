@@ -12,13 +12,20 @@
 # Compression can be tuned without editing the function:
 #
 #   QGPU_BACKUP_THREADS=2 QGPU_BACKUP_LEVEL=1 backup_qgpu_mps
+#
+# Raw .en energy files are omitted by default for speed. Include them only when
+# the backup must support rerunning qfep:
+#
+#   QGPU_BACKUP_INCLUDE_EN=1 backup_qgpu_mps
 
 backup_qgpu_mps() {
     local requested_archive="${1:-}"
     local requested_root="${2:-.}"
     local source_root archive source_name timestamp file_list file_count
+    local command_name data_root replicate_dir result_name result_path
     local threads="${QGPU_BACKUP_THREADS:-2}"
     local level="${QGPU_BACKUP_LEVEL:-1}"
+    local include_en="${QGPU_BACKUP_INCLUDE_EN:-0}"
 
     for command_name in find tar zstd mktemp; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -33,6 +40,10 @@ backup_qgpu_mps() {
     fi
     if [[ ! "$level" =~ ^([1-9]|1[0-9])$ ]]; then
         printf 'ERROR: QGPU_BACKUP_LEVEL must be an integer from 1 to 19\n' >&2
+        return 1
+    fi
+    if [[ "$include_en" != "0" && "$include_en" != "1" ]]; then
+        printf 'ERROR: QGPU_BACKUP_INCLUDE_EN must be 0 or 1\n' >&2
         return 1
     fi
 
@@ -63,35 +74,73 @@ backup_qgpu_mps() {
         return 1
     fi
 
-    # Keep analysis data and reproducibility metadata. In particular:
-    #   - .en permits qfep to be rerun with different analysis settings.
+    # Keep final analysis data and run metadata. In particular:
     #   - qfep.out contains the calculated FEP result.
+    #   - optional .en files permit qfep to be rerun with different settings.
     #   - jobs, logs, and metrics contain Slurm status and benchmark data.
     # Large .dcd, .re, and MD .log files below FEP1 are intentionally omitted.
+    #
+    # First discover and prune known data roots. This avoids recursively
+    # examining every file below FEP1 while looking for result directories.
     if ! (
-        cd "$source_root" &&
-            find . \( -type f -o -type l \) \
-                \( \
-                    \( -path '*/FEP1/*' \
-                        \( -name '*.en' \
-                            -o -name 'qfep.out*' \
-                            -o -name 'qfep.err' \
-                            -o -name 'qgpu_steps.tsv' \) \) \
-                    -o \( -path '*/inputfiles/*' \
+        cd "$source_root" || exit 1
+
+        while IFS= read -r -d '' data_root; do
+            case "$(basename "$data_root")" in
+                FEP1)
+                    # The runner writes results as FEP1/TEMPERATURE/REPLICATE.
+                    # Stat the three exact final-result names without scanning
+                    # every .dcd, .re, and .log entry in each replicate.
+                    while IFS= read -r -d '' replicate_dir; do
+                        for result_name in qfep.out qfep.err qgpu_steps.tsv; do
+                            result_path="$replicate_dir/$result_name"
+                            if [[ -f "$result_path" || -L "$result_path" ]]; then
+                                printf '%s\0' "$result_path"
+                            fi
+                        done
+                        if [[ "$include_en" == "1" ]]; then
+                            find "$replicate_dir" -maxdepth 1 \
+                                \( -type f -o -type l \) -name '*.en' -print0
+                        fi
+                    done < <(
+                        find "$data_root" -mindepth 2 -maxdepth 2 \
+                            -type d -print0
+                    )
+                    ;;
+                inputfiles)
+                    find "$data_root" -maxdepth 1 \
+                        \( -type f -o -type l \) \
                         \( -name 'fep_config.json' \
                             -o -name 'qfep.inp' \
-                            -o -name '*.fep' \) \) \
-                    -o -path '*/jobs/*' \
-                    -o -path '*/logs/*' \
-                    -o -path '*/metrics/*' \
-                    -o -name 'slurm*.out' \
-                    -o -name 'ligands.sdf' \
-                    -o -name 'water.pdb' \
-                    -o -name 'protein.pdb' \
-                    -o -name '*.json' \
-                    -o -name 'run_qgpu_mps_*.sh' \
-                \) \
-                -print0
+                            -o -name '*.fep' \) \
+                        -print0
+                    ;;
+                jobs|logs|metrics)
+                    find "$data_root" \( -type f -o -type l \) -print0
+                    ;;
+            esac
+        done < <(
+            find . \
+                \( -type d -name .git -prune \) \
+                -o \( -type d \
+                    \( -name FEP1 \
+                        -o -name inputfiles \
+                        -o -name jobs \
+                        -o -name logs \
+                        -o -name metrics \) \
+                    -print0 -prune \)
+        )
+
+        # Dataset-level metadata lives either in the selected dataset or one
+        # level below a collection directory such as qgpu_mps.
+        find . -maxdepth 2 \( -type f -o -type l \) \
+            \( -name 'slurm*.out' \
+                -o -name 'ligands.sdf' \
+                -o -name 'water.pdb' \
+                -o -name 'protein.pdb' \
+                -o \( -name '*.json' ! -path '*/inputfiles/*' \) \
+                -o -name 'run_qgpu_mps_*.sh' \) \
+            -print0
     ) > "$file_list"; then
         printf 'ERROR: failed while finding backup files\n' >&2
         rm -f -- "$file_list"
@@ -107,13 +156,18 @@ backup_qgpu_mps() {
     file_count="$(tr -cd '\0' < "$file_list" | wc -c)"
     file_count="${file_count//[[:space:]]/}"
     printf 'Archiving %s important files from %s\n' "$file_count" "$source_root"
+    if [[ "$include_en" == "1" ]]; then
+        printf 'Including raw .en energy files for qfep reanalysis\n'
+    else
+        printf 'Fast mode: keeping final qfep results, but not raw .en files\n'
+    fi
     printf 'Excluding FEP1 trajectories, restart files, and MD logs\n'
 
     if ! (
         set -o pipefail
         (
             cd "$source_root" &&
-                tar --create --file=- --null --no-recursion \
+                tar --create --file=- --no-xattrs --null --no-recursion \
                     --files-from="$file_list"
         ) | zstd -T"$threads" -"$level" -q -o "$archive"
     ); then
