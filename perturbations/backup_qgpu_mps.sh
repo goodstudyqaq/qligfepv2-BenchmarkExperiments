@@ -17,6 +17,14 @@
 # the backup must support rerunning qfep:
 #
 #   QGPU_BACKUP_INCLUDE_EN=1 backup_qgpu_mps
+#
+# To submit one dataset as a staging job, run this from its parent directory:
+#
+#   back_up bace
+#
+# This mode always includes .en files. Optional submission settings are
+# QGPU_BACKUP_TIME, QGPU_BACKUP_PARTITION, QGPU_BACKUP_MEM, and
+# QGPU_BACKUP_THREADS.
 
 backup_qgpu_mps() {
     local requested_archive="${1:-}"
@@ -181,4 +189,83 @@ backup_qgpu_mps() {
 
     printf 'Backup created: %s\n' "$archive"
     printf 'Verify it with: zstd -t %q\n' "$archive"
+}
+
+back_up() {
+    local requested_dataset="${1:-}"
+    local submit_root dataset_root dataset_name job_name timestamp
+    local archive log_path script_path script_dir
+    local partition="${QGPU_BACKUP_PARTITION:-staging}"
+    local time_limit="${QGPU_BACKUP_TIME:-04:00:00}"
+    local memory="${QGPU_BACKUP_MEM:-4G}"
+    local threads="${QGPU_BACKUP_THREADS:-2}"
+    local level="${QGPU_BACKUP_LEVEL:-1}"
+    local batch_command wrap_command job_id
+
+    if [[ -z "$requested_dataset" ]]; then
+        printf 'Usage: back_up DATASET_DIRECTORY\n' >&2
+        printf 'Example: back_up bace\n' >&2
+        return 2
+    fi
+    if ! command -v sbatch >/dev/null 2>&1; then
+        printf 'ERROR: sbatch is unavailable; run back_up on the HPC\n' >&2
+        return 1
+    fi
+    if [[ ! "$threads" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'ERROR: QGPU_BACKUP_THREADS must be a positive integer\n' >&2
+        return 1
+    fi
+    if [[ ! "$level" =~ ^([1-9]|1[0-9])$ ]]; then
+        printf 'ERROR: QGPU_BACKUP_LEVEL must be an integer from 1 to 19\n' >&2
+        return 1
+    fi
+
+    submit_root="$PWD"
+    if ! dataset_root="$(cd -P "$requested_dataset" 2>/dev/null && pwd)"; then
+        printf 'ERROR: dataset directory does not exist: %s\n' "$requested_dataset" >&2
+        return 1
+    fi
+    dataset_name="$(basename "$dataset_root")"
+    job_name="${dataset_name//[^[:alnum:]_-]/_}"
+    timestamp="$(date +%Y%m%d_%H%M%S)"
+    archive="$submit_root/${dataset_name}_important_${timestamp}.tar.zst"
+    log_path="$submit_root/${dataset_name}_backup.%j.log"
+
+    script_path="${QGPU_BACKUP_SCRIPT:-${BASH_SOURCE[0]}}"
+    if [[ ! -f "$script_path" ]]; then
+        printf 'ERROR: cannot locate backup script: %s\n' "$script_path" >&2
+        printf 'Set QGPU_BACKUP_SCRIPT to its absolute path and try again.\n' >&2
+        return 1
+    fi
+    script_dir="$(cd -P "$(dirname "$script_path")" && pwd)"
+    script_path="$script_dir/$(basename "$script_path")"
+
+    # Quote every path for the inner Bash process. sbatch --wrap itself remains
+    # fixed, so dataset names containing spaces or shell characters stay safe.
+    printf -v batch_command \
+        'source %q && QGPU_BACKUP_INCLUDE_EN=1 QGPU_BACKUP_THREADS=%q QGPU_BACKUP_LEVEL=%q backup_qgpu_mps %q %q' \
+        "$script_path" "$threads" "$level" "$archive" "$dataset_root"
+    printf -v wrap_command 'bash -c %q' "$batch_command"
+
+    if ! job_id="$(
+        sbatch \
+            --parsable \
+            --job-name="qgpu_backup_${job_name}" \
+            --partition="$partition" \
+            --time="$time_limit" \
+            --ntasks=1 \
+            --cpus-per-task="$threads" \
+            --mem="$memory" \
+            --chdir="$submit_root" \
+            --output="$log_path" \
+            --wrap="$wrap_command"
+    )"; then
+        printf 'ERROR: failed to submit backup job for %s\n' "$dataset_root" >&2
+        return 1
+    fi
+
+    printf 'Submitted backup job %s for %s\n' "$job_id" "$dataset_root"
+    printf 'Archive: %s\n' "$archive"
+    printf 'Log: %s\n' "${log_path//%j/$job_id}"
+    printf 'Monitor: squeue -j %q\n' "$job_id"
 }
