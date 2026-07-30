@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
 
+# Capture the absolute script path while the sourced relative path is still
+# resolvable. back_up needs this path later so that its Slurm job can source the
+# same functions even after the interactive shell changes directory.
+if [[ -z "${QGPU_BACKUP_SCRIPT:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _qgpu_backup_script_dir="$(
+        cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd
+    )"
+    if [[ -n "$_qgpu_backup_script_dir" ]]; then
+        QGPU_BACKUP_SCRIPT="$_qgpu_backup_script_dir/$(basename "${BASH_SOURCE[0]}")"
+    fi
+    unset _qgpu_backup_script_dir
+fi
+
 # Source this file, then run backup_qgpu_mps from a qgpu_mps results directory:
 #
 #   source /path/to/backup_qgpu_mps.sh
