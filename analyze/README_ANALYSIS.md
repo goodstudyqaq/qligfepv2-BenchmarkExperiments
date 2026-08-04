@@ -16,10 +16,32 @@ Pass a copied-data directory followed by its benchmark target:
 ./generate_figures.sh /path/to/thrombin_data thrombin
 ```
 
+Alternatively, pass a selective backup created by `backup_qgpu_mps.sh`
+directly. The target is inferred from the standard archive name:
+
+```bash
+./generate_figures.sh cdk2_important_20260730_140949.tar.zst
+```
+
+For a nonstandard archive name, provide the target explicitly:
+
+```bash
+./generate_figures.sh downloaded_results.tar.zst cdk2
+```
+
+Archive mode extracts `qfep.out`, job-validation metadata, and resource metrics
+into an adjacent `<archive-name>_extracted/` directory. Raw `.en` files remain
+safely inside the archive and are not unpacked just to generate figures. A
+completed extraction is reused when the command is run again.
+
 The data directory must contain a copied `jobs/` directory. Current MPS and
-batch jobs are read directly from:
+batch jobs are read from their respective layouts:
 
 ```text
+MPS:
+{1.water,2.protein}/<edge>/FEP1/<temperature>/<replicate>/qfep.out
+
+Batch:
 jobs/<job-id>_<edge>.both/work/{1.water,2.protein}/<edge>/FEP1/<temperature>/<replicate>/qfep.out
 ```
 
@@ -47,6 +69,17 @@ directories:
 ```bash
 python3 analyze_metrics.py /path/to/copied_data
 ```
+
+After `generate_figures.sh` has extracted an archive, pass that same directory
+to the metrics analyzer:
+
+```bash
+python3 analyze_metrics.py \
+    cdk2_important_20260730_140949_extracted
+```
+
+No second archive extraction is needed. The self-contained report is written
+as `metrics_report.html` inside the extracted directory.
 
 Outputs remain with the selected dataset:
 

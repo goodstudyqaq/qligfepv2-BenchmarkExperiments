@@ -45,7 +45,7 @@ def arguments() -> argparse.Namespace:
         nargs="?",
         type=Path,
         default=default_data,
-        help=f"Downloaded result directory (default: {default_data})",
+        help=f"Downloaded or extracted result directory (default: {default_data})",
     )
     parser.add_argument(
         "--output",
@@ -664,7 +664,8 @@ def main() -> int:
     args = arguments()
     data_dir = args.data_dir.expanduser().resolve()
     result_root = data_dir.parent if data_dir.name == "jobs" else data_dir
-    output = (args.output or result_root / "metrics_report.html").expanduser().resolve()
+    default_output = result_root / "metrics_report.html"
+    output = (args.output or default_output).expanduser().resolve()
     runs, steps, warnings = load_metrics(data_dir)
     if not runs:
         raise SystemExit(f"No system metrics could be loaded from {data_dir}")

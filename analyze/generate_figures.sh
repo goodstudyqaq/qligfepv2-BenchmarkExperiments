@@ -4,18 +4,109 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BENCHMARK_ROOT=$(cd -- "$ROOT/.." && pwd)
 
-if [[ $# -ne 2 ]]; then
-    printf 'Usage: %s DATA_DIR TARGET\n' "$(basename -- "$0")" >&2
-    printf 'Example: %s /path/to/new_data_in_hb cdk2\n' "$(basename -- "$0")" >&2
+usage() {
+    printf 'Usage:\n' >&2
+    printf '  %s DATA_DIR TARGET\n' "$(basename -- "$0")" >&2
+    printf '  %s TARGET_important_TIMESTAMP.tar.zst [TARGET]\n' \
+        "$(basename -- "$0")" >&2
+    printf '\nExamples:\n' >&2
+    printf '  %s /path/to/new_data_in_hb cdk2\n' "$(basename -- "$0")" >&2
+    printf '  %s cdk2_important_20260730_140949.tar.zst\n' \
+        "$(basename -- "$0")" >&2
+}
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    usage
     exit 2
 fi
 
-if [[ ! -d "$1/jobs" ]]; then
-    printf 'Missing jobs directory: %s\n' "$1/jobs" >&2
+INPUT=$1
+TARGET=${2:-}
+
+if [[ -f "$INPUT" && "$INPUT" == *.tar.zst ]]; then
+    for command_name in tar unzstd; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            printf 'Missing required command for .tar.zst input: %s\n' \
+                "$command_name" >&2
+            exit 1
+        fi
+    done
+
+    ARCHIVE_DIR=$(cd -- "$(dirname -- "$INPUT")" && pwd)
+    ARCHIVE="$ARCHIVE_DIR/$(basename -- "$INPUT")"
+    ARCHIVE_NAME=$(basename -- "$ARCHIVE" .tar.zst)
+
+    if [[ -z "$TARGET" ]]; then
+        if [[ "$ARCHIVE_NAME" =~ ^(.+)_important_[0-9]{8}_[0-9]{6}$ ]]; then
+            TARGET=${BASH_REMATCH[1]}
+        else
+            printf 'Cannot infer target from archive name: %s\n' \
+                "$(basename -- "$ARCHIVE")" >&2
+            printf 'Pass the target explicitly as the second argument.\n' >&2
+            exit 2
+        fi
+    fi
+
+    EXTRACT_DIR="${ARCHIVE%.tar.zst}_extracted"
+    EXTRACT_MARKER="$EXTRACT_DIR/.qgpu_archive_extracted"
+    if [[ -f "$EXTRACT_MARKER" ]]; then
+        printf 'Reusing extracted archive: %s\n' "$EXTRACT_DIR"
+        if ! find "$EXTRACT_DIR" -path '*/metrics/*' -type f \
+            -print -quit | grep -q .; then
+            printf 'Adding metrics missing from the existing extraction cache.\n'
+            if ! tar --use-compress-program=unzstd \
+                --no-same-owner --no-same-permissions \
+                --wildcards --no-anchored \
+                -xf "$ARCHIVE" -C "$EXTRACT_DIR" '*metrics/*'; then
+                printf 'Could not add metrics to %s\n' "$EXTRACT_DIR" >&2
+                exit 1
+            fi
+        fi
+    elif [[ -e "$EXTRACT_DIR" ]]; then
+        printf 'Extraction directory exists but is incomplete: %s\n' \
+            "$EXTRACT_DIR" >&2
+        printf 'Move it aside or choose a fresh archive copy before retrying.\n' >&2
+        exit 1
+    else
+        printf 'Extracting analysis files from %s\n' "$ARCHIVE"
+        printf 'Extracting qfep outputs, job metadata, and resource metrics.\n'
+        printf 'Raw .en files remain in the archive and are not extracted.\n'
+        mkdir -- "$EXTRACT_DIR"
+        if ! tar --use-compress-program=unzstd \
+            --no-same-owner --no-same-permissions \
+            --wildcards --no-anchored \
+            -xf "$ARCHIVE" -C "$EXTRACT_DIR" \
+            '1.water/FEP_*/FEP1/*/*/qfep.out' \
+            '2.protein/FEP_*/FEP1/*/*/qfep.out' \
+            'jobs/*/run_info.tsv' \
+            'jobs/*/exit_code.txt' \
+            'jobs/*/summary.tsv' \
+            '*metrics/*'; then
+            printf 'Archive extraction failed; partial data remains in %s\n' \
+                "$EXTRACT_DIR" >&2
+            exit 1
+        fi
+        printf '%s\n' "$ARCHIVE" > "$EXTRACT_MARKER"
+        printf 'Extracted data: %s\n' "$EXTRACT_DIR"
+    fi
+    NEW_DATA="$EXTRACT_DIR"
+elif [[ -d "$INPUT" ]]; then
+    if [[ $# -ne 2 ]]; then
+        printf 'A target is required when DATA_DIR is used.\n' >&2
+        usage
+        exit 2
+    fi
+    NEW_DATA=$(cd -- "$INPUT" && pwd)
+else
+    printf 'Input is neither a data directory nor a .tar.zst archive: %s\n' \
+        "$INPUT" >&2
     exit 1
 fi
-NEW_DATA=$(cd -- "$1" && pwd)
-TARGET=$2
+
+if [[ ! -d "$NEW_DATA/jobs" ]]; then
+    printf 'Missing jobs directory: %s\n' "$NEW_DATA/jobs" >&2
+    exit 1
+fi
 if [[ ! "$TARGET" =~ ^[A-Za-z0-9._-]+$ ]]; then
     printf 'Invalid target name: %s\n' "$TARGET" >&2
     exit 2
@@ -56,6 +147,27 @@ done
 printf '1/4 Analyzing QGPU jobs...\n'
 python3 "$ROOT/analyze_staged_jobs.py" "$NEW_DATA" \
     --mapping "$MAPPING"
+
+PAIRED_EDGE_COUNT=$(
+    python3 - "$ANALYSIS/ddg_summary.csv" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+with Path(sys.argv[1]).open(newline="") as handle:
+    print(sum(1 for _row in csv.DictReader(handle)))
+PY
+)
+if ((PAIRED_EDGE_COUNT < 2)); then
+    printf '\nCannot generate correlation figures: only %s edge(s) have paired water/protein results.\n' \
+        "$PAIRED_EDGE_COUNT" >&2
+    printf 'At least two paired edges are required for Pearson correlation.\n' >&2
+    printf 'Inspect failed or incomplete jobs in:\n  %s\n' \
+        "$ANALYSIS/job_validation.csv" >&2
+    printf 'Resource metrics can still be analyzed with:\n' >&2
+    printf '  python3 %q %q\n' "$ROOT/analyze_metrics.py" "$NEW_DATA" >&2
+    exit 1
+fi
 
 printf '2/4 Plotting QGPU versus Fortran...\n'
 python3 "$ROOT/correlate_fortran_gpu.py" \

@@ -121,7 +121,9 @@ backup_qgpu_mps() {
                         done
                         if [[ "$include_en" == "1" ]]; then
                             find "$replicate_dir" -maxdepth 1 \
-                                \( -type f -o -type l \) -name '*.en' -print0
+                                \( -type f -o -type l \) \
+                                \( -name '*.en' -o -name 'energies.tar.gz' \) \
+                                -print0
                         fi
                     done < <(
                         find "$data_root" -mindepth 2 -maxdepth 2 \

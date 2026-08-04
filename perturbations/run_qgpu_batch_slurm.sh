@@ -23,6 +23,7 @@ QGPU_SCRATCH_BASE="${QGPU_SCRATCH_BASE:-/scratch-shared/$QGPU_USER/qgpu_batch}"
 QGPU_OUTPUT_BASE="${QGPU_OUTPUT_BASE:-}"
 QGPU_CLEAN_EXTENSIONS="${QGPU_CLEAN_EXTENSIONS-dcd,log}"
 QGPU_KEEP_ONLY="${QGPU_KEEP_ONLY-}"
+QGPU_ARCHIVE_EN="${QGPU_ARCHIVE_EN:-0}"
 QGPU_CLEAN_ON_FAILURE="${QGPU_CLEAN_ON_FAILURE:-0}"
 LOG_DIR="${LOG_DIR:-}"
 
@@ -72,6 +73,8 @@ Options:
                      successful run. Default: dcd,log. Example: dcd,log,inp
   --keep-only LIST   In each job's work directory, keep only the listed
                      extensions or exact filenames. Example: en,qfep.out
+  --archive-en       Pack each replicate's *.en files into one energies.tar.gz
+                     after successful QFEP and before other cleanup.
   --no-clean         Keep all generated and copied files.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
@@ -93,6 +96,8 @@ Environment:
   QGPU_KEEP_ONLY=en,qfep.out          Keep only these files in each result work
                                       tree. Exact names contain a dot; other
                                       values are treated as extensions.
+  QGPU_ARCHIVE_EN=0                   Set to 1 to create one energies.tar.gz per
+                                      replicate and remove its individual *.en files.
   QGPU_CLEAN_ON_FAILURE=0             Also clean selected extensions after a failed run.
   LOG_DIR=$QGPU_SCRATCH_BASE/DATASET/logs
                                       Dataset-specific Slurm stdout directory.
@@ -207,6 +212,10 @@ parse_args() {
                 KEEP_ONLY_RAW="$2"
                 shift 2
                 ;;
+            --archive-en)
+                QGPU_ARCHIVE_EN=1
+                shift
+                ;;
             --no-clean)
                 CLEAN_EXTENSIONS_RAW=""
                 KEEP_ONLY_RAW=""
@@ -239,6 +248,8 @@ parse_args() {
     done
     [[ "$QGPU_CLEAN_ON_FAILURE" == "0" || "$QGPU_CLEAN_ON_FAILURE" == "1" ]] || \
         die "QGPU_CLEAN_ON_FAILURE must be 0 or 1"
+    [[ "$QGPU_ARCHIVE_EN" == "0" || "$QGPU_ARCHIVE_EN" == "1" ]] || \
+        die "QGPU_ARCHIVE_EN must be 0 or 1"
     normalize_clean_extensions
     normalize_keep_only
 }
@@ -411,6 +422,9 @@ build_child_args() {
     if [[ -n "$KEEP_ONLY_CSV" ]]; then
         printf '%s\0' "--keep-only" "$KEEP_ONLY_CSV"
     fi
+    if [[ "$QGPU_ARCHIVE_EN" == "1" ]]; then
+        printf '%s\0' "--archive-en"
+    fi
 }
 
 stage_submission_inputs() {
@@ -550,6 +564,7 @@ write_run_info() {
         printf 'result_dir\t%s\n' "$RESULT_DIR"
         printf 'clean_extensions\t%s\n' "${CLEAN_EXTENSIONS_CSV:-none}"
         printf 'keep_only\t%s\n' "${KEEP_ONLY_CSV:-none}"
+        printf 'archive_en\t%s\n' "$QGPU_ARCHIVE_EN"
         printf 'clean_on_failure\t%s\n' "$QGPU_CLEAN_ON_FAILURE"
         printf 'exit_code\t%s\n' "$rc"
     } > "$RESULT_DIR/run_info.tsv"
@@ -568,6 +583,9 @@ clean_selected_outputs() {
         while IFS= read -r -d '' file; do
             base="$(basename "$file")"
             keep=0
+            if [[ "$QGPU_ARCHIVE_EN" == "1" && "$base" == "energies.tar.gz" ]]; then
+                keep=1
+            fi
             for rule in "${KEEP_ONLY[@]}"; do
                 if [[ "$rule" == *.* ]]; then
                     [[ "$base" == "$rule" ]] && keep=1
@@ -600,6 +618,22 @@ clean_selected_outputs() {
         count="${count//[[:space:]]/}"
         log "Removed ${count:-0} *.$ext file(s) from $RESULT_DIR"
     done
+}
+
+archive_energy_outputs() {
+    local rc="$1"
+    local archiver="$SCRIPT_DIR/archive_en_replicates.sh"
+
+    [[ "$QGPU_ARCHIVE_EN" == "1" ]] || return 0
+    if [[ "$rc" -ne 0 ]]; then
+        log "Keeping individual *.en files because the run failed with exit code $rc"
+        return 0
+    fi
+    [[ -x "$archiver" ]] || {
+        log "ERROR: energy archiver is missing or not executable: $archiver"
+        return 1
+    }
+    "$archiver" "$STAGE_ROOT"
 }
 
 save_results() {
@@ -750,6 +784,13 @@ run_job_task() {
             fi
         fi
     done
+
+    if ! archive_energy_outputs "$rc"; then
+        log "WARNING: failed to create per-replicate energy archives in $RESULT_DIR"
+        if [[ "$rc" -eq 0 ]]; then
+            rc=1
+        fi
+    fi
 
     if ! clean_selected_outputs "$rc"; then
         log "WARNING: failed to clean selected extensions in $RESULT_DIR"

@@ -152,9 +152,109 @@ def qfep_outputs(job: Path) -> tuple[str, list[tuple[str, str]]]:
     return "missing", []
 
 
+def job_metadata(job: Path) -> tuple[str, str]:
+    """Return the wrapper exit code and validation status for one job."""
+    exit_path = job / "exit_code.txt"
+    exit_code = exit_path.read_text().strip() if exit_path.is_file() else "missing"
+    status_rows = []
+    if (job / "summary.tsv").is_file():
+        with (job / "summary.tsv").open(newline="") as handle:
+            status_rows = list(csv.DictReader(handle, delimiter="\t"))
+    status = (
+        "ok"
+        if exit_code == "0"
+        and len(status_rows) == 2
+        and all(row.get("status") == "ok" for row in status_rows)
+        else "check"
+    )
+    return exit_code, status
+
+
+def mps_jobs_by_edge(jobs_dir: Path) -> dict[str, Path]:
+    """Map FEP IDs to run_qgpu_mps_slurm result-metadata directories."""
+    result: dict[str, Path] = {}
+    for job in sorted(path for path in jobs_dir.iterdir() if path.is_dir()):
+        run_info = job / "run_info.tsv"
+        if not run_info.is_file():
+            continue
+        with run_info.open(newline="") as handle:
+            rows = csv.DictReader(handle, delimiter="\t")
+            info = {
+                str(row.get("key", "")): str(row.get("value", ""))
+                for row in rows
+            }
+        target = info.get("target", "")
+        edge = target if target.startswith("FEP_") else Path(target).name
+        if edge.startswith("FEP_"):
+            result[edge] = job
+    return result
+
+
+def mps_qfep_outputs(data_root: Path) -> list[Path]:
+    """Find qfep outputs written beside staged inputs by the MPS runner."""
+    outputs = []
+    for system_dir in ("1.water", "2.protein"):
+        system_root = data_root / system_dir
+        if system_root.is_dir():
+            outputs.extend(system_root.glob("FEP_*/FEP1/*/*/qfep.out"))
+    return sorted(path for path in outputs if path.is_file())
+
+
+def append_edge_rows(
+    edge: str,
+    legs: dict[str, dict[str, float]],
+    *,
+    source_job: str,
+    layout: str,
+    exit_code: str,
+    initial_status: str,
+    expected_replicates: int,
+    replicate_rows: list[dict[str, object]],
+    job_rows: list[dict[str, object]],
+) -> None:
+    """Validate one edge and append its paired replicate and job rows."""
+    reps = sorted(
+        set(legs["water"]) & set(legs["protein"]),
+        key=lambda value: int(value) if value.isdigit() else value,
+    )
+    status = initial_status
+    if (
+        set(legs["water"]) != set(legs["protein"])
+        or len(reps) != expected_replicates
+    ):
+        status = "check"
+    left, right = edge.removeprefix("FEP_").split("_", 1)
+    for rep in reps:
+        water, protein = legs["water"][rep], legs["protein"][rep]
+        replicate_rows.append(
+            {
+                "fep_id": edge,
+                "from": left,
+                "to": right,
+                "replicate": rep,
+                "water_dGbar": f"{water:.6f}",
+                "protein_dGbar": f"{protein:.6f}",
+                "Q_ddG": f"{protein - water:.6f}",
+                "source_job": source_job,
+            }
+        )
+    job_rows.append(
+        {
+            "fep_id": edge,
+            "job": source_job,
+            "layout": layout,
+            "exit_code": exit_code,
+            "status": status,
+            "water_replicates": len(legs["water"]),
+            "protein_replicates": len(legs["protein"]),
+        }
+    )
+
+
 def main() -> int:
     args = arguments()
     jobs_dir = resolve_jobs_dir(args.data_dir)
+    data_root = jobs_dir.parent
     output = args.output or jobs_dir.parent / "ddg_analysis"
     output.mkdir(parents=True, exist_ok=True)
     exp_q_convention = experimental_edges(args.mapping)
@@ -167,50 +267,95 @@ def main() -> int:
     replicate_rows: list[dict[str, object]] = []
     job_rows: list[dict[str, object]] = []
 
-    jobs = sorted(path for path in jobs_dir.glob("*.both") if path.is_dir())
-    if not jobs:
-        raise SystemExit(f"No *.both job directories found under {jobs_dir}")
-
-    for job in jobs:
-        exit_code = (job / "exit_code.txt").read_text().strip() if (job / "exit_code.txt").is_file() else "missing"
-        status_rows = []
-        if (job / "summary.tsv").is_file():
-            with (job / "summary.tsv").open(newline="") as handle:
-                status_rows = list(csv.DictReader(handle, delimiter="\t"))
-        job_status = "ok" if exit_code == "0" and len(status_rows) == 2 and all(r.get("status") == "ok" for r in status_rows) else "check"
-
-        legs: dict[str, dict[str, float]] = {"water": {}, "protein": {}}
-        edge_ids = set()
-        layout, outputs = qfep_outputs(job)
-        if layout == "missing":
-            raise FileNotFoundError(
-                f"{job}: found neither work/ nor staged_run.tar.gz"
-            )
-        if not outputs:
-            raise ValueError(f"No qfep.out files found in {job / layout}")
-        for source, text in outputs:
-            match = QFEP_PATH.search(source)
+    # The MPS wrapper writes FEP1 beside each staged input tree and stores only
+    # metadata under jobs/. Prefer that layout when those top-level outputs are
+    # present. The older per-job work/ and staged_run.tar.gz layouts remain
+    # supported below.
+    mps_outputs = mps_qfep_outputs(data_root)
+    if mps_outputs:
+        grouped: dict[str, dict[str, dict[str, float]]] = {}
+        for path in mps_outputs:
+            source = str(path)
+            match = QFEP_PATH.search(path.as_posix())
             if match is None:
                 continue
             system_dir, edge, _temperature, replicate = match.groups()
-            value = parse_bar(text, source)
+            value = parse_bar(
+                path.read_text(encoding="utf-8", errors="replace"), source
+            )
             system = "water" if system_dir == "1.water" else "protein"
+            legs = grouped.setdefault(edge, {"water": {}, "protein": {}})
+            if replicate in legs[system]:
+                raise ValueError(
+                    f"Duplicate {system} replicate {replicate} for {edge}"
+                )
             legs[system][replicate] = value
-            edge_ids.add(edge)
-        if len(edge_ids) != 1:
-            raise ValueError(f"Expected one FEP edge in {job}, found {sorted(edge_ids)}")
-        edge = edge_ids.pop()
-        reps = sorted(set(legs["water"]) & set(legs["protein"]), key=lambda x: int(x) if x.isdigit() else x)
-        if set(legs["water"]) != set(legs["protein"]) or len(reps) != args.expected_replicates:
-            job_status = "check"
-        left, right = edge.removeprefix("FEP_").split("_", 1)
-        for rep in reps:
-            water, protein = legs["water"][rep], legs["protein"][rep]
-            replicate_rows.append({"fep_id": edge, "from": left, "to": right, "replicate": rep,
-                                   "water_dGbar": f"{water:.6f}", "protein_dGbar": f"{protein:.6f}",
-                                   "Q_ddG": f"{protein - water:.6f}", "source_job": job.name})
-        job_rows.append({"fep_id": edge, "job": job.name, "layout": layout, "exit_code": exit_code, "status": job_status,
-                         "water_replicates": len(legs["water"]), "protein_replicates": len(legs["protein"])})
+
+        metadata = mps_jobs_by_edge(jobs_dir)
+        for edge in sorted(grouped):
+            job = metadata.get(edge)
+            if job is None:
+                exit_code, status, source_job = "missing", "check", "dataset-tree"
+            else:
+                exit_code, status = job_metadata(job)
+                source_job = job.name
+            append_edge_rows(
+                edge,
+                grouped[edge],
+                source_job=source_job,
+                layout="mps-dataset",
+                exit_code=exit_code,
+                initial_status=status,
+                expected_replicates=args.expected_replicates,
+                replicate_rows=replicate_rows,
+                job_rows=job_rows,
+            )
+        analyzed_jobs = len(grouped)
+    else:
+        jobs = sorted(path for path in jobs_dir.glob("*.both") if path.is_dir())
+        if not jobs:
+            raise SystemExit(
+                f"Found neither dataset-level MPS qfep.out files nor "
+                f"*.both job directories under {data_root}"
+            )
+
+        for job in jobs:
+            exit_code, status = job_metadata(job)
+            legs: dict[str, dict[str, float]] = {"water": {}, "protein": {}}
+            edge_ids = set()
+            layout, outputs = qfep_outputs(job)
+            if layout == "missing":
+                raise FileNotFoundError(
+                    f"{job}: found neither work/ nor staged_run.tar.gz"
+                )
+            if not outputs:
+                raise ValueError(f"No qfep.out files found in {job / layout}")
+            for source, text in outputs:
+                match = QFEP_PATH.search(source)
+                if match is None:
+                    continue
+                system_dir, edge, _temperature, replicate = match.groups()
+                value = parse_bar(text, source)
+                system = "water" if system_dir == "1.water" else "protein"
+                legs[system][replicate] = value
+                edge_ids.add(edge)
+            if len(edge_ids) != 1:
+                raise ValueError(
+                    f"Expected one FEP edge in {job}, found {sorted(edge_ids)}"
+                )
+            edge = edge_ids.pop()
+            append_edge_rows(
+                edge,
+                legs,
+                source_job=job.name,
+                layout=layout,
+                exit_code=exit_code,
+                initial_status=status,
+                expected_replicates=args.expected_replicates,
+                replicate_rows=replicate_rows,
+                job_rows=job_rows,
+            )
+        analyzed_jobs = len(jobs)
 
     summary_rows = []
     for edge in sorted({r["fep_id"] for r in replicate_rows}):
@@ -238,7 +383,14 @@ def main() -> int:
                "previous_Q_ddG_avg", "new_minus_previous"])
     write_csv(output / "job_validation.csv", job_rows,
               ["fep_id", "job", "layout", "exit_code", "status", "water_replicates", "protein_replicates"])
-    print(f"Analyzed {len(jobs)} jobs / {len(replicate_rows)} paired replicates")
+    print(
+        f"Analyzed {analyzed_jobs} jobs / "
+        f"{len(replicate_rows)} paired replicates"
+    )
+    print(
+        f"Edges with paired water/protein results: "
+        f"{len(summary_rows)}/{len(job_rows)}"
+    )
     print(f"Validation: {sum(r['status'] == 'ok' for r in job_rows)} ok, {sum(r['status'] != 'ok' for r in job_rows)} check")
     print(f"Results: {output / 'ddg_summary.csv'}")
     return 0
