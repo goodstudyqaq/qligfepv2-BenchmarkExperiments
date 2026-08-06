@@ -26,6 +26,8 @@ CLEAN_AFTER="${CLEAN_AFTER:-1}"
 KEEP_QFEP_ONLY="${KEEP_QFEP_ONLY:-1}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
 REPLICATES="${REPLICATES:-10}"
+QGPU_ARCHIVE_EN="${QGPU_ARCHIVE_EN:-0}"
+QGPU_EN_ARCHIVER="${QGPU_EN_ARCHIVER:-$SCRIPT_DIR/archive_en_replicates.sh}"
 QGPU_DISABLE_WATER_POLX="${QGPU_DISABLE_WATER_POLX:-0}"
 
 ONLY=""
@@ -65,6 +67,8 @@ Environment:
   CONTINUE_ON_ERROR=0                 Continue to next system after a failed system.
   REPLICATES=10                        Number of replicates to run when --replicates is not set.
   QGPU_DISABLE_WATER_POLX=0           Diagnostic only: turn water input polarisation off in staged copies.
+  QGPU_ARCHIVE_EN=0                   Archive each replicate's *.en immediately after successful QFEP.
+  QGPU_EN_ARCHIVER=/path/to/helper    archive_en_replicates.sh used when QGPU_ARCHIVE_EN=1.
   QDYN_FAILURE_LOG_LINES=120          Lines of failed qdyn stdout log copied into the runner log.
   QDYN_FAILURE_ERR_LINES=80           Lines of failed qdyn stderr log copied into the runner log.
 EOF
@@ -595,7 +599,10 @@ run_qfep_step() {
 
 cleanup_replicate_outputs() {
     if [[ "$KEEP_QFEP_ONLY" == "1" ]]; then
-        find . -maxdepth 1 -type f ! -name 'qfep.out' -delete
+        find . -maxdepth 1 -type f \
+            ! -name 'qfep.out' \
+            ! -name 'energies.tar.gz' \
+            -delete
     else
         rm -f ./*.dcd ./*.inp
     fi
@@ -664,6 +671,17 @@ run_replicate() {
         if ! run_qfep_step; then
             log "Stopping replicate $run_num after failed qfep step"
             return 1
+        fi
+
+        if [[ "$QGPU_ARCHIVE_EN" == "1" ]]; then
+            if [[ ! -x "$QGPU_EN_ARCHIVER" ]]; then
+                log "Energy archiver is missing or not executable: $QGPU_EN_ARCHIVER"
+                return 1
+            fi
+            if ! "$QGPU_EN_ARCHIVER" --replicate "$rundir"; then
+                log "Stopping replicate $run_num after failed energy archival"
+                return 1
+            fi
         fi
 
         if [[ "$CLEAN_AFTER" == "1" ]]; then

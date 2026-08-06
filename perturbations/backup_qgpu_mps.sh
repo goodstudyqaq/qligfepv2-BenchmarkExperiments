@@ -97,7 +97,7 @@ backup_qgpu_mps() {
 
     # Keep final analysis data and run metadata. In particular:
     #   - qfep.out contains the calculated FEP result.
-    #   - optional .en files permit qfep to be rerun with different settings.
+    #   - optional raw or archived .en data permits qfep reanalysis.
     #   - jobs, logs, and metrics contain Slurm status and benchmark data.
     # Large .dcd, .re, and MD .log files below FEP1 are intentionally omitted.
     #
@@ -130,6 +130,12 @@ backup_qgpu_mps() {
                             -type d -print0
                     )
                     ;;
+                energy_archives)
+                    if [[ "$include_en" == "1" ]]; then
+                        find "$data_root" -maxdepth 1 \
+                            \( -type f -o -type l \) -name '*.energies.tar' -print0
+                    fi
+                    ;;
                 inputfiles)
                     find "$data_root" -maxdepth 1 \
                         \( -type f -o -type l \) \
@@ -147,6 +153,7 @@ backup_qgpu_mps() {
                 \( -type d -name .git -prune \) \
                 -o \( -type d \
                     \( -name FEP1 \
+                        -o -name energy_archives \
                         -o -name inputfiles \
                         -o -name jobs \
                         -o -name logs \
@@ -180,7 +187,7 @@ backup_qgpu_mps() {
     file_count="${file_count//[[:space:]]/}"
     printf 'Archiving %s important files from %s\n' "$file_count" "$source_root"
     if [[ "$include_en" == "1" ]]; then
-        printf 'Including raw .en energy files for qfep reanalysis\n'
+        printf 'Including raw or archived .en energy data for qfep reanalysis\n'
     else
         printf 'Fast mode: keeping final qfep results, but not raw .en files\n'
     fi

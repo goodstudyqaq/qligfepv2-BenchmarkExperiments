@@ -45,6 +45,7 @@ MPS_STARTED=0
 RESULT_DIR=""
 RUN_TARGET=""
 RESULT_SAVED=0
+EDGE_ARCHIVE=""
 RUN_ROOTS=()
 OUTPUT_ROOTS=()
 LOCK_DIRS=()
@@ -76,7 +77,8 @@ Options:
                      each generated FEP1 directory.
                      Example: en,qfep.out
   --archive-en       Pack each replicate's *.en files into one energies.tar.gz
-                     after successful QFEP and before other cleanup.
+                     immediately after successful QFEP, then combine all
+                     replicate archives into one edge energy archive.
   --no-clean         Keep all generated files.
   --limit N         Submit the first N FEP edges in the default order.
   --dry-run         Print the edge list and sbatch command without submitting.
@@ -100,7 +102,8 @@ Environment:
                                       FEP1 tree. Exact names contain a dot; other
                                       values are treated as extensions.
   QGPU_ARCHIVE_EN=0                   Set to 1 to create one energies.tar.gz per
-                                      replicate and remove its individual *.en files.
+                                      replicate, then one *.energies.tar per edge;
+                                      verified source files are removed at each layer.
   QGPU_CLEAN_ON_FAILURE=0             Also clean selected extensions after a failed run.
   LOG_DIR=$QGPU_SCRATCH_BASE/DATASET/logs
                                       Dataset-specific Slurm stdout directory.
@@ -541,21 +544,30 @@ stage_system_path() {
 
 stage_dataset_runner() {
     local stage_root="$1"
-    local dst tmp
+    local runner_dst runner_tmp archiver_src archiver_dst archiver_tmp
 
     # The local runner resolves 1.water and 2.protein relative to its own
-    # location, so install one copy at the staged dataset root.
-    dst="$stage_root/$(basename "$RUNNER")"
+    # location, so install it and its energy archiver at the dataset root.
+    runner_dst="$stage_root/$(basename "$RUNNER")"
+    archiver_src="$SCRIPT_DIR/archive_en_replicates.sh"
+    archiver_dst="$stage_root/$(basename "$archiver_src")"
+    [[ -x "$archiver_src" ]] || die "Energy archiver is missing or not executable: $archiver_src"
     if ((SUBMIT_DRY_RUN)); then
-        printf 'Would install runner %s -> %s\n' "$RUNNER" "$dst"
+        printf 'Would install runner %s -> %s\n' "$RUNNER" "$runner_dst"
+        printf 'Would install archiver %s -> %s\n' "$archiver_src" "$archiver_dst"
         return 0
     fi
 
     mkdir -p "$stage_root"
-    tmp="$dst.tmp.${BASHPID:-$$}"
-    cp -p "$RUNNER" "$tmp"
-    chmod +x "$tmp"
-    mv -f -- "$tmp" "$dst"
+    runner_tmp="$runner_dst.tmp.${BASHPID:-$$}"
+    cp -p "$RUNNER" "$runner_tmp"
+    chmod +x "$runner_tmp"
+    mv -f -- "$runner_tmp" "$runner_dst"
+
+    archiver_tmp="$archiver_dst.tmp.${BASHPID:-$$}"
+    cp -p "$archiver_src" "$archiver_tmp"
+    chmod +x "$archiver_tmp"
+    mv -f -- "$archiver_tmp" "$archiver_dst"
 }
 
 resolve_run_roots() {
@@ -635,6 +647,7 @@ write_run_info() {
         printf 'clean_extensions\t%s\n' "${CLEAN_EXTENSIONS_CSV:-none}"
         printf 'keep_only\t%s\n' "${KEEP_ONLY_CSV:-none}"
         printf 'archive_en\t%s\n' "$QGPU_ARCHIVE_EN"
+        printf 'edge_energy_archive\t%s\n' "${EDGE_ARCHIVE:-none}"
         printf 'clean_on_failure\t%s\n' "$QGPU_CLEAN_ON_FAILURE"
         printf 'exit_code\t%s\n' "$rc"
     } > "$RESULT_DIR/run_info.tsv"
@@ -702,11 +715,11 @@ archive_energy_outputs() {
     local rc="$1"
     local archiver="$SCRIPT_DIR/archive_en_replicates.sh"
     local archive_roots=()
-    local output_root
+    local output_root edge_tag edge_archive
 
     [[ "$QGPU_ARCHIVE_EN" == "1" ]] || return 0
     if [[ "$rc" -ne 0 ]]; then
-        log "Keeping individual *.en files because the run failed with exit code $rc"
+        log "Keeping individual energy files/archives because the edge failed with exit code $rc"
         return 0
     fi
     for output_root in "${OUTPUT_ROOTS[@]}"; do
@@ -720,7 +733,16 @@ archive_energy_outputs() {
         log "ERROR: energy archiver is missing or not executable: $archiver"
         return 1
     }
+
+    # Normally the local runner already created these immediately after each
+    # successful QFEP. This pass also handles an older staged runner safely.
     "$archiver" "${archive_roots[@]}"
+
+    edge_tag="$(target_tag "$RUN_TARGET")"
+    edge_archive="$DATASET_DIR/energy_archives/$edge_tag.energies.tar"
+    "$archiver" --edge "$edge_archive" "$DATASET_DIR" "${archive_roots[@]}"
+    EDGE_ARCHIVE="$edge_archive"
+    log "Created edge energy archive: $EDGE_ARCHIVE"
 }
 
 save_results() {
@@ -886,6 +908,7 @@ run_job_task() {
     # Keep all runner output until the wrapper applies the selected extension
     # policy. This guarantees that .en files are not removed by legacy cleanup.
     export CLEAN_AFTER=0
+    export QGPU_EN_ARCHIVER="$DATASET_DIR/archive_en_replicates.sh"
 
     set +e
     "$dataset_runner" "${runner_args[@]}"
