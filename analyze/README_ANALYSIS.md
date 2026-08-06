@@ -55,6 +55,13 @@ The driver:
    `*_FEP_results.json` for a result-directory variant);
 4. generates QGPU-versus-Fortran and experiment-correlation figures.
 
+Non-finite values (`NaN` or infinity) are excluded before correlation and error
+statistics are calculated. QGPU-versus-experiment and Fortran-versus-experiment
+use each method's own finite rows, so the two panels can have different `N`
+values. Direct QGPU-versus-Fortran statistics use only their common finite
+edges. `experiment_correlation_stats.csv` also includes a `common_valid` scope
+for comparing both methods on exactly the same experimental edges.
+
 To generate only the free-energy CSV files, either the data root or `jobs/`
 itself may be passed:
 
