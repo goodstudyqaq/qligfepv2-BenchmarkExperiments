@@ -180,6 +180,7 @@ python3 "$ROOT/correlate_fortran_gpu.py" \
 printf '3/4 Building experiment/QGPU/Fortran table...\n'
 python3 - "$ANALYSIS/ddg_summary.csv" "$JOINED_FORTRAN" "$JOINED_EXPERIMENT" <<'PY'
 import csv
+import math
 import sys
 from pathlib import Path
 
@@ -190,42 +191,51 @@ with summary_path.open(newline="") as handle:
 with fortran_path.open(newline="") as handle:
     fortran = {row["fep_id"]: row for row in csv.DictReader(handle)}
 
-common = sorted(set(summaries) & set(fortran))
-if not common:
-    raise SystemExit("No common FEP IDs between QGPU and Fortran tables")
+qgpu_edges = sorted(summaries)
+if not qgpu_edges:
+    raise SystemExit("No QGPU edges available for experiment comparison")
 
 fields = [
     "fep_id", "from", "to", "exp_ddG", "hpc_ddGbar", "fortran_ddGbar",
     "hpc_minus_exp", "fortran_minus_exp", "hpc_sem", "fortran_sem",
 ]
 rows = []
-for fep_id in common:
+for fep_id in qgpu_edges:
     q = summaries[fep_id]
-    f = fortran[fep_id]
     exp_text = q.get("exp_ddG_Q_convention", "")
     if not exp_text:
         raise SystemExit(f"Missing sign-aligned experimental ddG for {fep_id}")
     exp = float(exp_text)
     qgpu = float(q["Q_ddG_avg"])
-    fort = float(f["fortran"])
+    if not math.isfinite(exp) or not math.isfinite(qgpu):
+        raise SystemExit(f"Non-finite experiment or QGPU value for {fep_id}")
+
+    f = fortran.get(fep_id)
+    fort = None if f is None else float(f["fortran"])
+    if fort is not None and not math.isfinite(fort):
+        fort = None
     rows.append({
         "fep_id": fep_id,
         "from": q["from"],
         "to": q["to"],
         "exp_ddG": f"{exp:.6f}",
         "hpc_ddGbar": f"{qgpu:.6f}",
-        "fortran_ddGbar": f"{fort:.6f}",
+        "fortran_ddGbar": "" if fort is None else f"{fort:.6f}",
         "hpc_minus_exp": f"{qgpu - exp:.6f}",
-        "fortran_minus_exp": f"{fort - exp:.6f}",
+        "fortran_minus_exp": "" if fort is None else f"{fort - exp:.6f}",
         "hpc_sem": q.get("Q_ddG_sem", ""),
-        "fortran_sem": f.get("fortran_sem", ""),
+        "fortran_sem": "" if f is None else f.get("fortran_sem", ""),
     })
 
 with output_path.open("w", newline="") as handle:
     writer = csv.DictWriter(handle, fieldnames=fields)
     writer.writeheader()
     writer.writerows(rows)
-print(f"Wrote {len(rows)} joined edges to {output_path}")
+fortran_count = sum(bool(row["fortran_ddGbar"]) for row in rows)
+print(
+    f"Wrote {len(rows)} QGPU/experiment edges to {output_path}; "
+    f"{fortran_count} also have finite Fortran values"
+)
 PY
 
 printf '4/4 Plotting QGPU and Fortran versus experiment...\n'

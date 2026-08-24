@@ -70,9 +70,10 @@ def optional_float(value: object) -> float | None:
     if value in (None, ""):
         return None
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return None
+    return result if math.isfinite(result) else None
 
 
 def load_rows(path: Path) -> list[dict[str, object]]:
@@ -90,17 +91,14 @@ def load_rows(path: Path) -> list[dict[str, object]]:
                 "to": row.get("to", ""),
                 "exp_ddG": exp_ddg,
             }
-            missing_method = False
             for method in METHODS:
                 value = optional_float(row.get(method["value_column"]))
-                if value is None:
-                    missing_method = True
-                    break
-                loaded[method["key"]] = value
-                loaded[f"{method['key']}_sem"] = optional_float(
-                    row.get(method["sem_column"])
-                )
-            if not missing_method:
+                if value is not None:
+                    loaded[method["key"]] = value
+                    loaded[f"{method['key']}_sem"] = optional_float(
+                        row.get(method["sem_column"])
+                    )
+            if any(method["key"] in loaded for method in METHODS):
                 rows.append(loaded)
 
     if not rows:
@@ -108,17 +106,25 @@ def load_rows(path: Path) -> list[dict[str, object]]:
     return rows
 
 
-def stats_for_method(rows: list[dict[str, object]], method: dict[str, str]) -> dict[str, object]:
-    xs = [float(row["exp_ddG"]) for row in rows]
-    ys = [float(row[method["key"]]) for row in rows]
+def stats_for_method(
+    rows: list[dict[str, object]], method: dict[str, str], scope: str
+) -> dict[str, object]:
+    method_rows = [row for row in rows if method["key"] in row]
+    if len(method_rows) < 2:
+        raise ValueError(
+            f"{method['label']} needs at least two finite rows for {scope} statistics"
+        )
+    xs = [float(row["exp_ddG"]) for row in method_rows]
+    ys = [float(row[method["key"]]) for row in method_rows]
     diffs = [y - x for x, y in zip(xs, ys)]
     abs_diffs = [abs(diff) for diff in diffs]
     slope, intercept = linear_fit(xs, ys)
-    max_index = max(range(len(rows)), key=lambda idx: abs_diffs[idx])
+    max_index = max(range(len(method_rows)), key=lambda idx: abs_diffs[idx])
 
     return {
+        "scope": scope,
         "method": method["label"],
-        "n": len(rows),
+        "n": len(method_rows),
         "pearson_r": pearson(xs, ys),
         "spearman_rho": spearman(xs, ys),
         "kendall_tau_b": kendall_tau_b(xs, ys),
@@ -128,7 +134,7 @@ def stats_for_method(rows: list[dict[str, object]], method: dict[str, str]) -> d
         "mae_mue": mean(abs_diffs),
         "rmse": math.sqrt(mean(diff * diff for diff in diffs)),
         "max_abs_error": abs_diffs[max_index],
-        "max_abs_error_edge": rows[max_index]["fep_id"],
+        "max_abs_error_edge": method_rows[max_index]["fep_id"],
     }
 
 
@@ -138,6 +144,7 @@ def write_stats(path: Path, stats_rows: list[dict[str, object]]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
+        "scope",
         "method",
         "n",
         "pearson_r",
@@ -184,6 +191,7 @@ def plot_rows(path: Path, rows: list[dict[str, object]], stats_rows: list[dict[s
         float(row[method["key"]])
         for method in METHODS
         for row in rows
+        if method["key"] in row
     ]
     low = math.floor(min(exp_values + calc_values) - 1.0)
     high = math.ceil(max(exp_values + calc_values) + 1.0)
@@ -193,6 +201,7 @@ def plot_rows(path: Path, rows: list[dict[str, object]], stats_rows: list[dict[s
         abs(float(row[method["key"]]) - float(row["exp_ddG"]))
         for method in METHODS
         for row in rows
+        if method["key"] in row
     ]
     vmax = max(1.0, math.ceil(max(all_abs_errors)))
     norm = Normalize(vmin=0.0, vmax=vmax)
@@ -203,13 +212,16 @@ def plot_rows(path: Path, rows: list[dict[str, object]], stats_rows: list[dict[s
     cax = fig.add_subplot(grid_spec[0, 2])
 
     scatter = None
-    stats_by_method = {row["method"]: row for row in stats_rows}
+    stats_by_method = {
+        row["method"]: row for row in stats_rows if row["scope"] == "all_valid"
+    }
     for ax, method in zip(axes, METHODS):
         method_key = method["key"]
         method_label = method["label"]
-        xs = exp_values
-        ys = [float(row[method_key]) for row in rows]
-        yerr_values = [row.get(f"{method_key}_sem") for row in rows]
+        method_rows = [row for row in rows if method_key in row]
+        xs = [float(row["exp_ddG"]) for row in method_rows]
+        ys = [float(row[method_key]) for row in method_rows]
+        yerr_values = [row.get(f"{method_key}_sem") for row in method_rows]
         yerr = [float(value) if value is not None else 0.0 for value in yerr_values]
         use_yerr = any(value is not None and float(value) > 0 for value in yerr_values)
         abs_errors = [abs(y - x) for x, y in zip(xs, ys)]
@@ -280,7 +292,7 @@ def plot_rows(path: Path, rows: list[dict[str, object]], stats_rows: list[dict[s
         ax.set_ylim(low, high)
         ax.set_aspect("equal", adjustable="box")
         ax.grid(True, linestyle="--", linewidth=0.35, color="0.75", alpha=0.7)
-        ax.set_title(f"{method_label} vs experiment (N = {len(rows)})")
+        ax.set_title(f"{method_label} vs experiment (N = {len(method_rows)})")
         ax.set_xlabel(r"Experimental $\Delta\Delta G$ (kcal/mol)")
         if ax is axes[0]:
             ax.set_ylabel(r"Calculated $\Delta\Delta G_{calc}$ (kcal/mol)")
@@ -311,7 +323,7 @@ def print_stats(source: Path, stats_rows: list[dict[str, object]]) -> None:
     print("X = experiment, Y = calculated")
     for stats in stats_rows:
         print()
-        print(f"{stats['method']} (N = {stats['n']})")
+        print(f"{stats['method']} [{stats['scope']}] (N = {stats['n']})")
         print(f"Pearson r     = {float(stats['pearson_r']):.6f}")
         print(f"Spearman rho  = {float(stats['spearman_rho']):.6f}")
         print(f"Kendall tau-b = {float(stats['kendall_tau_b']):.6f}")
@@ -331,7 +343,17 @@ def print_stats(source: Path, stats_rows: list[dict[str, object]]) -> None:
 def main() -> int:
     args = parse_args()
     rows = load_rows(args.input)
-    stats_rows = [stats_for_method(rows, method) for method in METHODS]
+    stats_rows = [
+        stats_for_method(rows, method, "all_valid") for method in METHODS
+    ]
+    common_rows = [
+        row for row in rows if all(method["key"] in row for method in METHODS)
+    ]
+    if len(common_rows) >= 2:
+        stats_rows.extend(
+            stats_for_method(common_rows, method, "common_valid")
+            for method in METHODS
+        )
 
     print_stats(args.input, stats_rows)
 

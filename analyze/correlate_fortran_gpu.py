@@ -164,6 +164,22 @@ def first_present(row: dict[str, str], names: list[str]) -> str | None:
     return None
 
 
+def finite_float(value: object) -> float | None:
+    """Return a finite float, treating missing, NaN, and infinity as invalid."""
+    if value in (None, ""):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def finite_optional_value(value: object) -> object:
+    """Keep a numeric uncertainty only when it is finite."""
+    return value if finite_float(value) is not None else ""
+
+
 def load_fortran(path: Path, metric: str) -> dict[str, dict[str, object]]:
     with path.open() as handle:
         data = json.load(handle)
@@ -175,15 +191,25 @@ def load_fortran(path: Path, metric: str) -> dict[str, dict[str, object]]:
     sem_key = f"{metric}_sem"
     std_key = f"{metric}_std"
     rows: dict[str, dict[str, object]] = {}
+    excluded: list[str] = []
     for fep_id, item in data["result"][metric].items():
+        value = finite_float(item.get(avg_key))
+        if value is None:
+            excluded.append(fep_id)
+            continue
         rows[fep_id] = {
             "fep_id": fep_id,
             "from": item.get("from", ""),
             "to": item.get("to", ""),
-            "fortran": float(item[avg_key]),
-            "fortran_sem": item.get(sem_key, ""),
-            "fortran_std": item.get(std_key, ""),
+            "fortran": value,
+            "fortran_sem": finite_optional_value(item.get(sem_key, "")),
+            "fortran_std": finite_optional_value(item.get(std_key, "")),
         }
+    if excluded:
+        print(
+            f"Excluded {len(excluded)} non-finite Fortran {metric} edge(s): "
+            + ", ".join(sorted(excluded))
+        )
     return rows
 
 
@@ -197,16 +223,16 @@ def load_gpu(path: Path) -> dict[str, dict[str, object]]:
         reader = csv.DictReader(handle)
         for row in reader:
             fep_id = row.get("fep_id")
-            value = first_present(row, value_columns)
+            value = finite_float(first_present(row, value_columns))
             if not fep_id or value is None:
                 continue
             rows[fep_id] = {
                 "fep_id": fep_id,
                 "from": row.get("from", ""),
                 "to": row.get("to", ""),
-                "gpu": float(value),
-                "gpu_sem": first_present(row, sem_columns) or "",
-                "gpu_std": first_present(row, std_columns) or "",
+                "gpu": value,
+                "gpu_sem": finite_optional_value(first_present(row, sem_columns)),
+                "gpu_std": finite_optional_value(first_present(row, std_columns)),
             }
     return rows
 
@@ -218,8 +244,10 @@ def load_comparison_csv(path: Path, metric: str) -> list[dict[str, object]]:
         for row in reader:
             if row.get("metric") != metric:
                 continue
-            fortran = float(row["fortran_avg"])
-            gpu = float(row["gpu_avg"])
+            fortran = finite_float(row.get("fortran_avg"))
+            gpu = finite_float(row.get("gpu_avg"))
+            if fortran is None or gpu is None:
+                continue
             diff = gpu - fortran
             rows.append(
                 {
@@ -296,12 +324,7 @@ def write_joined_rows(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def optional_float(value: object) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return finite_float(value)
 
 
 def plot_rows(path: Path, rows: list[dict[str, object]], metric: str) -> None:

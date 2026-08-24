@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+
+import re
+import sys
+from pathlib import Path
+
+
+if len(sys.argv) != 2:
+    sys.exit(
+        f"Usage: {Path(sys.argv[0]).name} SYSTEM\n"
+        f"Example: {Path(sys.argv[0]).name} cdk2"
+    )
+
+system = sys.argv[1]
+root = Path(__file__).resolve().parent / "perturbations" / system
+
+if not root.is_dir():
+    sys.exit(f"Error: {root} does not exist")
+
+section = re.compile(r"^\s*\[([^\]]+)\]")
+setting = re.compile(r"^(\s*)(\S+)(\s+)(.*?)(\r?\n)?$")
+inline_comment = re.compile(r"(\s+[!#*].*)$")
+
+aliases = {
+    "shake-solvent": "constrain_solvent",
+    "shake-hydrogens": "constrain_hydrogens",
+    "shake-solute": "constrain_solute",
+}
+desired = {
+    "hmr": ("hmr", "on"),
+    "constrain-solvent": ("constrain_solvent", "on"),
+    "constrain-hydrogens": ("constrain_hydrogens", "on"),
+    "constrain-solute": ("constrain_solute", "on"),
+    "constraint-algorithm": ("constraint_algorithm", "lincs settle"),
+}
+
+
+def normalize(key):
+    return key.lower().replace("_", "-")
+
+
+def add_missing_settings(lines, seen, newline, file_desired):
+    additions = []
+    for normalized_key, (key, value) in file_desired.items():
+        if normalized_key not in seen:
+            additions.append(f"{key:<26}{value}{newline}")
+
+    insert_at = len(lines)
+    while insert_at > 0 and not lines[insert_at - 1].strip():
+        insert_at -= 1
+    lines[insert_at:insert_at] = additions
+
+
+changed = 0
+missing_md = 0
+
+for path in root.glob("**/inputfiles/*.inp"):
+    lines = path.read_text().splitlines(keepends=True)
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+
+    current_steps = None
+    current_stepsize = None
+    scanning_md = False
+    for line in lines:
+        section_match = section.match(line)
+        if section_match:
+            scanning_md = section_match.group(1).strip().lower() == "md"
+            continue
+        setting_match = setting.match(line) if scanning_md else None
+        if not setting_match:
+            continue
+        key = normalize(setting_match.group(2))
+        value = setting_match.group(4).split()[0]
+        if key == "steps":
+            current_steps = int(value)
+        elif key == "stepsize":
+            current_stepsize = float(value)
+
+    if current_steps is None or current_stepsize is None:
+        print(f"Skipped {path}: [MD] steps or stepsize is missing.", file=sys.stderr)
+        continue
+
+    is_eq1 = path.name.lower() == "eq1.inp"
+    target_stepsize = 0.2 if is_eq1 else 4.0
+    exact_target_steps = current_steps * current_stepsize / target_stepsize
+    target_steps = round(exact_target_steps)
+    if abs(exact_target_steps - target_steps) > 1e-9:
+        print(
+            f"Skipped {path}: cannot preserve the simulated duration with an "
+            f"integer number of {target_stepsize:g} fs steps.",
+            file=sys.stderr,
+        )
+        continue
+
+    file_desired = {
+        "steps": ("steps", str(target_steps)),
+        "stepsize": ("stepsize", f"{target_stepsize:.1f}"),
+        **desired,
+    }
+    if not is_eq1:
+        file_desired["bath-coupling"] = ("bath_coupling", "10")
+    in_md = False
+    found_md = False
+    seen = set()
+    new_lines = []
+
+    for line in lines:
+        section_match = section.match(line)
+        if section_match:
+            if in_md:
+                add_missing_settings(new_lines, seen, newline, file_desired)
+            in_md = section_match.group(1).strip().lower() == "md"
+            found_md = found_md or in_md
+
+        setting_match = setting.match(line) if in_md and not section_match else None
+        if setting_match:
+            indent, old_key, gap, old_value, ending = setting_match.groups()
+            normalized_key = normalize(old_key)
+            canonical_key = aliases.get(normalized_key)
+            if canonical_key:
+                normalized_key = normalize(canonical_key)
+
+            if normalized_key in file_desired:
+                if normalized_key in seen:
+                    continue
+
+                key, value = file_desired[normalized_key]
+                comment_match = inline_comment.search(old_value)
+                comment = comment_match.group(1) if comment_match else ""
+
+                if old_key != key and "\t" not in gap:
+                    value_column = len(indent) + len(old_key) + len(gap)
+                    gap = " " * max(1, value_column - len(indent) - len(key))
+
+                line = f"{indent}{key}{gap}{value}{comment}{ending or ''}"
+                seen.add(normalized_key)
+
+        new_lines.append(line)
+
+    if in_md:
+        add_missing_settings(new_lines, seen, newline, file_desired)
+
+    if not found_md:
+        missing_md += 1
+        continue
+
+    new_text = "".join(new_lines)
+    old_text = "".join(lines)
+    if new_text != old_text:
+        path.write_text(new_text)
+        changed += 1
+
+print(f"Changed {changed} input files for {system}.")
+if missing_md:
+    print(f"Skipped {missing_md} input files without an [MD] section.", file=sys.stderr)
