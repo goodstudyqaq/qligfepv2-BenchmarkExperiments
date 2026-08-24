@@ -1,5 +1,7 @@
 # https://wiki.hpc.rug.nl/habrok/advanced_job_management/running_jobs_on_gpus
 # Persistent shared storage                      
+export QGPU_KEEP_ONLY="log,qfep.out"
+export QGPU_ARCHIVE_EN="1"
 export QGPU_SCRATCH_BASE="/scratch/$USER/qgpu_mps"           
 
 # Hábrók GPU request
@@ -20,7 +22,6 @@ export QGPU_MODULES="CUDA/12.6.0"
 export QDYN="/home6/p323093/Q/bin/qdyn"
 export QFEP="/home6/p323093/code/Q/src/q6/bin/q6/qfep"
 
-export CLEAN_AFTER=0
 
 ./run_qgpu_mps_slurm.sh \
 --dataset cdk2 \
