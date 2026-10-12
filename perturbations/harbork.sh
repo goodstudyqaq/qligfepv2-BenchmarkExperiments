@@ -1,5 +1,7 @@
 # https://wiki.hpc.rug.nl/habrok/advanced_job_management/running_jobs_on_gpus
 # Persistent shared storage                      
+export QGPU_KEEP_ONLY="log,qfep.out"
+export QGPU_ARCHIVE_EN="1"
 export QGPU_SCRATCH_BASE="/scratch/$USER/qgpu_mps"           
 
 # Hábrók GPU request
