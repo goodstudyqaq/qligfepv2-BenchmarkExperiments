@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Select LINCS for solute and solvent without changing other MD settings."""
+
+import re
+import sys
+from pathlib import Path
+
+
+if len(sys.argv) != 2:
+    sys.exit(f"Usage: {Path(sys.argv[0]).name} SYSTEM\nExample: {Path(sys.argv[0]).name} cdk2")
+
+system = sys.argv[1]
+root = Path(__file__).resolve().parent / "perturbations" / system
+if not root.is_dir():
+    sys.exit(f"Error: {root} does not exist")
+
+section = re.compile(r"^\s*\[([^\]]+)\]")
+setting = re.compile(r"^([ \t]*)constraint[_-]algorithm([ \t]+)(.*?)(\r?\n)?$", re.IGNORECASE)
+comment = re.compile(r"([ \t]+[!#*].*)$")
+changed = 0
+missing_md = 0
+
+for path in root.glob("**/inputfiles/*.inp"):
+    with path.open(newline="") as handle:
+        old_text = handle.read()
+    newline = "\r\n" if "\r\n" in old_text else "\n"
+    new_lines = []
+    in_md = False
+    found_md = False
+    seen = False
+
+    def add_missing_algorithm():
+        if seen:
+            return
+        insert_at = len(new_lines)
+        while insert_at > 0 and not new_lines[insert_at - 1].strip():
+            insert_at -= 1
+        if insert_at and not new_lines[insert_at - 1].endswith("\n"):
+            new_lines[insert_at - 1] += newline
+        new_lines.insert(insert_at, f"constraint_algorithm      lincs lincs{newline}")
+
+    for line in old_text.splitlines(keepends=True):
+        section_match = section.match(line)
+        if section_match:
+            if in_md:
+                add_missing_algorithm()
+            in_md = section_match.group(1).strip().lower() == "md"
+            found_md = found_md or in_md
+            seen = False
+
+        match = setting.match(line) if in_md and not section_match else None
+        if match:
+            if seen:
+                continue
+            indent, gap, old_value, ending = match.groups()
+            comment_match = comment.search(old_value)
+            suffix = comment_match.group(1) if comment_match else ""
+            line = f"{indent}constraint_algorithm{gap}lincs lincs{suffix}{ending or ''}"
+            seen = True
+        new_lines.append(line)
+
+    if in_md:
+        add_missing_algorithm()
+    if not found_md:
+        missing_md += 1
+        continue
+
+    new_text = "".join(new_lines)
+    if new_text != old_text:
+        with path.open("w", newline="") as handle:
+            handle.write(new_text)
+        changed += 1
+
+print(f"Changed {changed} input files for {system}.")
+if missing_md:
+    print(f"Skipped {missing_md} input files without an [MD] section.", file=sys.stderr)
