@@ -14,13 +14,15 @@ export SBATCH_TIME=2:00:00
 
 # Runtime software
 export QGPU_MODULE_PURGE=1
-export QGPU_MODULES="CUDA/12.6.0"
+export QGPU_MODULES="OpenMPI/4.1.4-GCC-11.3.0 CUDA/12.6.0"
 
 # Replace these with your Hábrók installations
-export QDYN="/home6/p323093/Q/bin/qdyn"
+export QDYN="/home6/p323093/code/Q/bin/qdyn"
 export QFEP="/home6/p323093/code/Q/src/q6/bin/q6/qfep"
 
-export CLEAN_AFTER=0
+export CLEAN_AFTER="0"
+export QGPU_KEEP_ONLY="log,qfep.out"
+export QGPU_ARCHIVE_EN="1"
 
 ./run_qgpu_mps_slurm.sh \
 --dataset cdk2 \
