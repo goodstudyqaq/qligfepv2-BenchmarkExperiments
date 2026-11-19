@@ -60,20 +60,23 @@ for path in root.glob("**/inputfiles/*.inp"):
 
     current_steps = None
     current_stepsize = None
-    scanning_md = False
+    current_energy = None
+    scanning_section = None
     for line in lines:
         section_match = section.match(line)
         if section_match:
-            scanning_md = section_match.group(1).strip().lower() == "md"
+            scanning_section = section_match.group(1).strip().lower()
             continue
-        setting_match = setting.match(line) if scanning_md else None
+        setting_match = setting.match(line) if scanning_section in {"md", "intervals"} else None
         if not setting_match:
             continue
         key = normalize(setting_match.group(2))
         value = setting_match.group(4).split()[0]
-        if key == "steps":
+        if scanning_section == "intervals" and key == "energy":
+            current_energy = int(value)
+        elif scanning_section == "md" and key == "steps":
             current_steps = int(value)
-        elif key == "stepsize":
+        elif scanning_section == "md" and key == "stepsize":
             current_stepsize = float(value)
 
     if current_steps is None or current_stepsize is None:
@@ -92,6 +95,20 @@ for path in root.glob("**/inputfiles/*.inp"):
         )
         continue
 
+    # Preserve energy sampling in simulated time, and leave disabled output alone.
+    # Using the original timestep also prevents repeated runs from halving again.
+    target_energy = current_energy
+    if current_energy is not None and current_energy > 0:
+        exact_target_energy = current_energy * current_stepsize / target_stepsize
+        target_energy = round(exact_target_energy)
+        if target_energy < 1 or abs(exact_target_energy - target_energy) > 1e-9:
+            print(
+                f"Skipped {path}: cannot preserve the energy sampling interval "
+                f"with an integer number of {target_stepsize:g} fs steps.",
+                file=sys.stderr,
+            )
+            continue
+
     file_desired = {
         "steps": ("steps", str(target_steps)),
         "stepsize": ("stepsize", f"{target_stepsize:.1f}"),
@@ -100,6 +117,7 @@ for path in root.glob("**/inputfiles/*.inp"):
     if not is_eq1:
         file_desired["bath-coupling"] = ("bath_coupling", "10")
     in_md = False
+    in_intervals = False
     found_md = False
     seen = set()
     new_lines = []
@@ -110,6 +128,7 @@ for path in root.glob("**/inputfiles/*.inp"):
             if in_md:
                 add_missing_settings(new_lines, seen, newline, file_desired)
             in_md = section_match.group(1).strip().lower() == "md"
+            in_intervals = section_match.group(1).strip().lower() == "intervals"
             found_md = found_md or in_md
 
         setting_match = setting.match(line) if in_md and not section_match else None
@@ -134,6 +153,13 @@ for path in root.glob("**/inputfiles/*.inp"):
 
                 line = f"{indent}{key}{gap}{value}{comment}{ending or ''}"
                 seen.add(normalized_key)
+
+        interval_match = setting.match(line) if in_intervals and not section_match else None
+        if interval_match and normalize(interval_match.group(2)) == "energy":
+            indent, key, gap, old_value, ending = interval_match.groups()
+            comment_match = inline_comment.search(old_value)
+            comment = comment_match.group(1) if comment_match else ""
+            line = f"{indent}{key}{gap}{target_energy}{comment}{ending or ''}"
 
         new_lines.append(line)
 
