@@ -29,6 +29,10 @@ REPLICATES="${REPLICATES:-10}"
 QGPU_ARCHIVE_EN="${QGPU_ARCHIVE_EN:-0}"
 QGPU_EN_ARCHIVER="${QGPU_EN_ARCHIVER:-$SCRIPT_DIR/archive_en_replicates.sh}"
 QGPU_DISABLE_WATER_POLX="${QGPU_DISABLE_WATER_POLX:-0}"
+# fixed = run every md_*.inp (default); walk = adaptive lambda walk after eq5
+QGPU_SCHEDULE="${QGPU_SCHEDULE:-fixed}"
+QGPU_PYTHON="${QGPU_PYTHON:-python}"
+QGPU_WALK_ARGS="${QGPU_WALK_ARGS:-}"
 
 ONLY=""
 LIMIT=0
@@ -71,6 +75,10 @@ Environment:
   QGPU_EN_ARCHIVER=/path/to/helper    archive_en_replicates.sh used when QGPU_ARCHIVE_EN=1.
   QDYN_FAILURE_LOG_LINES=120          Lines of failed qdyn stdout log copied into the runner log.
   QDYN_FAILURE_ERR_LINES=80           Lines of failed qdyn stderr log copied into the runner log.
+  QGPU_SCHEDULE=fixed                 fixed: run every md_*.inp. walk: after eq5, run the adaptive
+                                      lambda walk (python -m qgpu.run_walk) instead of the md stages.
+  QGPU_PYTHON=python                  Python with the qgpu package, used when QGPU_SCHEDULE=walk.
+  QGPU_WALK_ARGS=""                   Extra arguments for qgpu.run_walk, e.g. "--dg-limit 0.05".
 EOF
 }
 
@@ -183,6 +191,11 @@ require_runtime_commands() {
     [[ -x "$QDYN" ]] || die "QDYN is not executable: $QDYN"
     [[ -x "$QFEP" ]] || die "QFEP is not executable: $QFEP"
     command -v nvidia-smi >/dev/null || die "nvidia-smi is required"
+    [[ "$QGPU_SCHEDULE" == "fixed" || "$QGPU_SCHEDULE" == "walk" ]] || die "QGPU_SCHEDULE must be fixed or walk"
+    if [[ "$QGPU_SCHEDULE" == "walk" ]]; then
+        "$QGPU_PYTHON" -c "import qgpu.run_walk" >/dev/null 2>&1 || \
+            die "QGPU_SCHEDULE=walk needs the qgpu Python package: $QGPU_PYTHON cannot import qgpu.run_walk"
+    fi
 
     if ! nvidia-smi -i "$GPU_ID" --query-gpu=power.draw --format=csv,noheader,nounits >/dev/null 2>&1; then
         GPU_HAS_POWER=0
@@ -573,6 +586,30 @@ run_qdyn_step() {
     return "$rc"
 }
 
+run_walk_step() {
+    local start end rc
+    local fep_name="${CURRENT_FEP_NAME:-unknown_fep}"
+    local system_label="${CURRENT_SYSTEM_LABEL:-unknown_system}"
+    local replicate="${CURRENT_REPLICATE:-unknown_rep}"
+    local walk_args=()
+
+    read -r -a walk_args <<< "$QGPU_WALK_ARGS"
+    start="$(date +%s)"
+    log "START fep=$fep_name system=$system_label rep=$replicate step=walk"
+    set +e
+    "$QGPU_PYTHON" -m qgpu.run_walk "${walk_args[@]}" > walk.log 2> walk.err
+    rc=$?
+    set -e
+    end="$(date +%s)"
+    printf '%s\t%s\t%s\t%s\t%s\n' "walk" "$start" "$end" "$((end - start))" "$rc" >> qgpu_steps.tsv
+    log "DONE fep=$fep_name system=$system_label rep=$replicate step=walk wall_sec=$((end - start)) exit_code=$rc"
+    if [[ "$rc" -ne 0 ]]; then
+        tail_if_present walk.err "$QDYN_FAILURE_ERR_LINES"
+        tail_if_present walk.log "$QDYN_FAILURE_LOG_LINES"
+    fi
+    return "$rc"
+}
+
 run_qfep_step() {
     local start end rc
     local fep_name="${CURRENT_FEP_NAME:-unknown_fep}"
@@ -661,12 +698,21 @@ run_replicate() {
         cd "$rundir"
         log "Starting replicate $run_num in $rundir, T=$temperature, seed=$seed"
         for input in "${inputs[@]}"; do
+            # The walk replaces every md stage; the equilibration stays as it is.
+            if [[ "$QGPU_SCHEDULE" == "walk" && "$input" == md_*.inp ]]; then
+                continue
+            fi
             [[ -f "$input" ]] || die "Missing input file in $rundir: $input"
             if ! run_qdyn_step "$input"; then
                 log "Stopping replicate $run_num after failed qdyn step: $input"
                 return 1
             fi
         done
+
+        if [[ "$QGPU_SCHEDULE" == "walk" ]] && ! run_walk_step; then
+            log "Stopping replicate $run_num after failed walk"
+            return 1
+        fi
 
         if ! run_qfep_step; then
             log "Stopping replicate $run_num after failed qfep step"
