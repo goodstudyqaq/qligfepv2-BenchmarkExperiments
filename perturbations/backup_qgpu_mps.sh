@@ -110,10 +110,12 @@ backup_qgpu_mps() {
             case "$(basename "$data_root")" in
                 FEP1)
                     # The runner writes results as FEP1/TEMPERATURE/REPLICATE.
-                    # Stat the three exact final-result names without scanning
+                    # Stat the exact final-result names without scanning
                     # every .dcd, .re, and .log entry in each replicate.
+                    # walk.* exist only for runs with QGPU_SCHEDULE=walk.
                     while IFS= read -r -d '' replicate_dir; do
-                        for result_name in qfep.out qfep.err qgpu_steps.tsv; do
+                        for result_name in qfep.out qfep.err qgpu_steps.tsv \
+                            walk.tsv walk.log walk.err; do
                             result_path="$replicate_dir/$result_name"
                             if [[ -f "$result_path" || -L "$result_path" ]]; then
                                 printf '%s\0' "$result_path"
