@@ -1,0 +1,37 @@
+{
+  "nodes": {
+    "17": {
+      "dg_value": -7.041,
+      "smiles": "[H][C]1=[N][c]2[c]([O][C]([H])([H])[C]3([H])[C]([H])([H])[C]([H])([H])[C]([H])([H])[C]([H])([H])[C]3([H])[H])[n][c]([N]([H])[c]3[c]([H])[c]([H])[c]([H])[c]([Br])[c]3[H])[n][c]2[N]1[H]",
+      "formal_charge": 0.0
+    },
+    "21": {
+      "dg_value": -7.828,
+      "smiles": "[H][C]1=[N][c]2[c]([O][C]([H])([H])[C]3([H])[C]([H])([H])[C]([H])([H])[C]([H])([H])[C]([H])([H])[C]3([H])[H])[n][c]([N]([H])[c]3[c]([H])[c]([H])[c]([H])[c]([O][C]([H])([H])[H])[c]3[H])[n][c]2[N]1[H]",
+      "formal_charge": 0.0
+    },
+    "22": {
+      "dg_value": -7.862,
+      "smiles": "[H][C]1=[N][c]2[c]([O][C]([H])([H])[C]3([H])[C]([H])([H])[C]([H])([H])[C]([H])([H])[C]([H])([H])[C]3([H])[H])[n][c]([N]([H])[c]3[c]([H])[c]([H])[c]([H])[c]([S][C]([H])([H])[H])[c]3[H])[n][c]2[N]1[H]",
+      "formal_charge": 0.0
+    }
+  },
+  "edges": [
+    {
+      "from": "21",
+      "to": "22",
+      "similarity": 0.951229424500714,
+      "strict_flag": true,
+      "ddg_value": -0.03,
+      "same_charge": true
+    },
+    {
+      "from": "22",
+      "to": "17",
+      "similarity": 0.8607079764250578,
+      "strict_flag": true,
+      "ddg_value": 0.82,
+      "same_charge": true
+    }
+  ]
+}
