@@ -31,11 +31,21 @@ fi
 #
 #   QGPU_BACKUP_INCLUDE_EN=1 backup_qgpu_mps
 #
+# Trajectories are omitted by default because they are large. Include the
+# .dcd files, plus the topology files (*.pdb, *.top) in inputfiles needed to
+# read them, only when the structures must be inspected:
+#
+#   QGPU_BACKUP_INCLUDE_DCD=1 backup_qgpu_mps
+#
+# The run must have kept its .dcd files (for example QGPU_KEEP_ONLY=...,dcd),
+# and QGPU_SCHEDULE=walk runs never write any.
+#
 # To submit one dataset as a staging job, run this from its parent directory:
 #
 #   back_up bace
 #
-# This mode always includes .en files. Optional submission settings are
+# This mode always includes .en files and honours QGPU_BACKUP_INCLUDE_DCD.
+# Optional submission settings are
 # QGPU_BACKUP_TIME, QGPU_BACKUP_PARTITION, QGPU_BACKUP_MEM, and
 # QGPU_BACKUP_THREADS.
 
@@ -47,6 +57,7 @@ backup_qgpu_mps() {
     local threads="${QGPU_BACKUP_THREADS:-2}"
     local level="${QGPU_BACKUP_LEVEL:-1}"
     local include_en="${QGPU_BACKUP_INCLUDE_EN:-0}"
+    local include_dcd="${QGPU_BACKUP_INCLUDE_DCD:-0}"
 
     for command_name in find tar zstd mktemp; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -65,6 +76,10 @@ backup_qgpu_mps() {
     fi
     if [[ "$include_en" != "0" && "$include_en" != "1" ]]; then
         printf 'ERROR: QGPU_BACKUP_INCLUDE_EN must be 0 or 1\n' >&2
+        return 1
+    fi
+    if [[ "$include_dcd" != "0" && "$include_dcd" != "1" ]]; then
+        printf 'ERROR: QGPU_BACKUP_INCLUDE_DCD must be 0 or 1\n' >&2
         return 1
     fi
 
@@ -99,7 +114,8 @@ backup_qgpu_mps() {
     #   - qfep.out contains the calculated FEP result.
     #   - optional raw or archived .en data permits qfep reanalysis.
     #   - jobs, logs, and metrics contain Slurm status and benchmark data.
-    # Large .dcd, .re, and MD .log files below FEP1 are intentionally omitted.
+    # Large .dcd, .re, and MD .log files below FEP1 are intentionally omitted,
+    # unless QGPU_BACKUP_INCLUDE_DCD=1 asks for the .dcd trajectories.
     #
     # First discover and prune known data roots. This avoids recursively
     # examining every file below FEP1 while looking for result directories.
@@ -127,6 +143,11 @@ backup_qgpu_mps() {
                                 \( -name '*.en' -o -name 'energies.tar.gz' \) \
                                 -print0
                         fi
+                        if [[ "$include_dcd" == "1" ]]; then
+                            find "$replicate_dir" -maxdepth 1 \
+                                \( -type f -o -type l \) -name '*.dcd' \
+                                -print0
+                        fi
                     done < <(
                         find "$data_root" -mindepth 2 -maxdepth 2 \
                             -type d -print0
@@ -145,6 +166,13 @@ backup_qgpu_mps() {
                             -o -name 'qfep.inp' \
                             -o -name '*.fep' \) \
                         -print0
+                    # A .dcd holds coordinates only; these give the atoms.
+                    if [[ "$include_dcd" == "1" ]]; then
+                        find "$data_root" -maxdepth 1 \
+                            \( -type f -o -type l \) \
+                            \( -name '*.pdb' -o -name '*.top' \) \
+                            -print0
+                    fi
                     ;;
                 jobs|logs|metrics)
                     find "$data_root" \( -type f -o -type l \) -print0
@@ -193,7 +221,15 @@ backup_qgpu_mps() {
     else
         printf 'Fast mode: keeping final qfep results, but not raw .en files\n'
     fi
-    printf 'Excluding FEP1 trajectories, restart files, and MD logs\n'
+    if [[ "$include_dcd" == "1" ]]; then
+        printf 'Including .dcd trajectories and inputfiles topology (*.pdb, *.top)\n'
+        if ! grep -zq '\.dcd$' "$file_list"; then
+            printf 'WARNING: QGPU_BACKUP_INCLUDE_DCD=1 but no .dcd files were found\n' >&2
+        fi
+        printf 'Excluding FEP1 restart files and MD logs\n'
+    else
+        printf 'Excluding FEP1 trajectories, restart files, and MD logs\n'
+    fi
 
     if ! (
         set -o pipefail
@@ -224,6 +260,7 @@ back_up() {
     local memory="${QGPU_BACKUP_MEM:-4G}"
     local threads="${QGPU_BACKUP_THREADS:-2}"
     local level="${QGPU_BACKUP_LEVEL:-1}"
+    local include_dcd="${QGPU_BACKUP_INCLUDE_DCD:-0}"
     local batch_command wrap_command job_id
 
     if [[ -z "$requested_dataset" ]]; then
@@ -241,6 +278,11 @@ back_up() {
     fi
     if [[ ! "$level" =~ ^([1-9]|1[0-9])$ ]]; then
         printf 'ERROR: QGPU_BACKUP_LEVEL must be an integer from 1 to 19\n' >&2
+        return 1
+    fi
+
+    if [[ "$include_dcd" != "0" && "$include_dcd" != "1" ]]; then
+        printf 'ERROR: QGPU_BACKUP_INCLUDE_DCD must be 0 or 1\n' >&2
         return 1
     fi
 
@@ -267,8 +309,8 @@ back_up() {
     # Quote every path for the inner Bash process. sbatch --wrap itself remains
     # fixed, so dataset names containing spaces or shell characters stay safe.
     printf -v batch_command \
-        'source %q && QGPU_BACKUP_INCLUDE_EN=1 QGPU_BACKUP_THREADS=%q QGPU_BACKUP_LEVEL=%q backup_qgpu_mps %q %q' \
-        "$script_path" "$threads" "$level" "$archive" "$dataset_root"
+        'source %q && QGPU_BACKUP_INCLUDE_EN=1 QGPU_BACKUP_INCLUDE_DCD=%q QGPU_BACKUP_THREADS=%q QGPU_BACKUP_LEVEL=%q backup_qgpu_mps %q %q' \
+        "$script_path" "$include_dcd" "$threads" "$level" "$archive" "$dataset_root"
     printf -v wrap_command 'bash -c %q' "$batch_command"
 
     if ! job_id="$(
